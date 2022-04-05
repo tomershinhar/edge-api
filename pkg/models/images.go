@@ -20,20 +20,22 @@ type ImageSet struct {
 // Image is what generates a OSTree Commit.
 type Image struct {
 	Model
-	Name         string         `json:"Name"`
-	Account      string         `json:"Account"`
-	Distribution string         `json:"Distribution"`
-	Description  string         `json:"Description"`
-	Status       string         `json:"Status"`
-	Version      int            `json:"Version" gorm:"default:1"`
-	ImageType    string         `json:"ImageType"` // TODO: Remove as soon as the frontend stops using
-	OutputTypes  pq.StringArray `gorm:"type:text[]" json:"OutputTypes"`
-	CommitID     uint           `json:"CommitID"`
-	Commit       *Commit        `json:"Commit"`
-	InstallerID  *uint          `json:"InstallerID"`
-	Installer    *Installer     `json:"Installer"`
-	ImageSetID   *uint          `json:"ImageSetID"` // TODO: Wipe staging database and set to not nullable
-	Packages     []Package      `json:"Packages" gorm:"many2many:images_packages;"`
+	Name                   string           `json:"Name"`
+	Account                string           `json:"Account"`
+	Distribution           string           `json:"Distribution"`
+	Description            string           `json:"Description"`
+	Status                 string           `json:"Status"`
+	Version                int              `json:"Version" gorm:"default:1"`
+	ImageType              string           `json:"ImageType"` // TODO: Remove as soon as the frontend stops using
+	OutputTypes            pq.StringArray   `gorm:"type:text[]" json:"OutputTypes"`
+	CommitID               uint             `json:"CommitID"`
+	Commit                 *Commit          `json:"Commit"`
+	InstallerID            *uint            `json:"InstallerID"`
+	Installer              *Installer       `json:"Installer"`
+	ImageSetID             *uint            `json:"ImageSetID" gorm:"index"` // TODO: Wipe staging database and set to not nullable
+	Packages               []Package        `json:"Packages,omitempty" gorm:"many2many:images_packages;"`
+	ThirdPartyRepositories []ThirdPartyRepo `json:"ThirdPartyRepositories,omitempty" gorm:"many2many:images_repos;"`
+	CustomPackages         []Package        `json:"CustomPackages,omitempty" gorm:"many2many:images_custom_packages"`
 }
 
 // ImageUpdateAvailable contains image and differences between current and available commits
@@ -75,14 +77,16 @@ const (
 	// ImageTypeCommit is the installer image type on Image Builder
 	ImageTypeCommit = "rhel-edge-commit"
 
-	// ImageStatusCreated is for when a image is created
+	// ImageStatusCreated is for when an image is created
 	ImageStatusCreated = "CREATED"
-	// ImageStatusBuilding is for when a image is building
+	// ImageStatusBuilding is for when an image is building
 	ImageStatusBuilding = "BUILDING"
-	// ImageStatusError is for when a image is on a error state
+	// ImageStatusError is for when an image is on a error state
 	ImageStatusError = "ERROR"
-	// ImageStatusSuccess is for when a image is available to the user
+	// ImageStatusSuccess is for when an image is available to the user
 	ImageStatusSuccess = "SUCCESS"
+	// ImageStatusInterrupted is for when an image build is interrupted
+	ImageStatusInterrupted = "INTERRUPTED"
 
 	// MissingInstaller is the error message for not passing an installer in the request
 	MissingInstaller = "installer info must be provided"
@@ -183,4 +187,17 @@ func checkIfImageExist(imageName string) bool {
 		return false
 	}
 	return imageFindByName != nil
+}
+
+// GetALLPackagesList returns all the packages including custom packages containing their names
+func (i *Image) GetALLPackagesList() *[]string {
+	initialPackages := *i.GetPackagesList()
+	packages := make([]string, 0, len(initialPackages)+len(i.CustomPackages))
+
+	packages = append(packages, initialPackages...)
+
+	for _, pkg := range i.CustomPackages {
+		packages = append(packages, pkg.Name)
+	}
+	return &packages
 }

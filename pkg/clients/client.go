@@ -2,13 +2,9 @@ package clients
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
-
-	log "github.com/sirupsen/logrus"
-
-	"github.com/redhatinsights/platform-go-middlewares/identity"
+	"github.com/redhatinsights/edge-api/pkg/routes/common"
 	"github.com/redhatinsights/platform-go-middlewares/request_id"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/redhatinsights/edge-api/config"
 )
@@ -19,13 +15,13 @@ func GetOutgoingHeaders(ctx context.Context) map[string]string {
 	requestID := request_id.GetReqID(ctx)
 	headers := map[string]string{"x-rh-insights-request-id": requestID}
 	if config.Get().Auth {
-		xhrid := identity.Get(ctx)
-		identityHeaders, err := json.Marshal(xhrid)
+		xrhid, err := common.GetOriginalIdentity(ctx)
+
 		if err != nil {
-			log.WithField("error", err.Error()).Fatal("Error getting request ID")
-			panic(err)
+			log.Error("Error getting x-rh-identity")
+		} else {
+			headers["x-rh-identity"] = xrhid
 		}
-		headers["x-rh-identity"] = base64.StdEncoding.EncodeToString(identityHeaders)
 	}
 	return headers
 }

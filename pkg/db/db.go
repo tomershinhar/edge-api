@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/redhatinsights/edge-api/config"
+	"github.com/redhatinsights/edge-api/logger"
+	log "github.com/sirupsen/logrus"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -33,6 +35,16 @@ func InitDB() {
 
 	DB, err = gorm.Open(dia, &gorm.Config{})
 	if err != nil {
-		panic(fmt.Sprintf("failed to connect database: %s", err.Error()))
+		logger.LogErrorAndPanic("failed to connect database", err)
+	}
+
+	if cfg.Database.Type == "pgsql" {
+		var minorVersion string
+		DB.Raw("SELECT version()").Scan(&minorVersion)
+		if err != nil {
+			log.WithFields(log.Fields{"error": err.Error()}).Error("error selecting version")
+		}
+
+		log.Infof("Postgres information: '%s'", minorVersion)
 	}
 }

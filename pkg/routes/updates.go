@@ -27,6 +27,7 @@ func MakeUpdatesRouter(sub chi.Router) {
 		r.Use(UpdateCtx)
 		r.Get("/", GetUpdateByID)
 		r.Get("/update-playbook.yml", GetUpdatePlaybook)
+		r.Get("/notify", SendNotificationForDevice) //TMP ROUTE TO SEND THE NOTIFICATION
 	})
 	// TODO: This is for backwards compatibility with the previous route
 	// Once the frontend starts querying the device
@@ -51,7 +52,9 @@ func UpdateCtx(next http.Handler) http.Handler {
 			}).Error("Error retrieving account")
 			err := errors.NewBadRequest(err.Error())
 			w.WriteHeader(err.GetStatus())
-			json.NewEncoder(w).Encode(&err)
+			if err := json.NewEncoder(w).Encode(&err); err != nil {
+				services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+			}
 			return
 		}
 		updateID := chi.URLParam(r, "updateID")
@@ -59,14 +62,18 @@ func UpdateCtx(next http.Handler) http.Handler {
 		if updateID == "" {
 			err := errors.NewBadRequest("UpdateTransactionID can't be empty")
 			w.WriteHeader(err.GetStatus())
-			json.NewEncoder(w).Encode(&err)
+			if err := json.NewEncoder(w).Encode(&err); err != nil {
+				services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+			}
 			return
 		}
 		id, err := strconv.Atoi(updateID)
 		if err != nil {
 			err := errors.NewBadRequest(err.Error())
 			w.WriteHeader(err.GetStatus())
-			json.NewEncoder(w).Encode(&err)
+			if err := json.NewEncoder(w).Encode(&err); err != nil {
+				services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+			}
 			return
 		}
 		result := db.DB.Preload("DispatchRecords").Preload("Devices").Where("update_transactions.account = ?", account).Joins("Commit").Joins("Repo").Find(&update, id)
@@ -76,7 +83,9 @@ func UpdateCtx(next http.Handler) http.Handler {
 			}).Error("Error retrieving update")
 			err := errors.NewInternalServerError()
 			w.WriteHeader(err.GetStatus())
-			json.NewEncoder(w).Encode(&err)
+			if err := json.NewEncoder(w).Encode(&err); err != nil {
+				services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+			}
 			return
 		}
 		ctx := context.WithValue(r.Context(), UpdateContextKey, &update)
@@ -97,7 +106,9 @@ func GetUpdatePlaybook(w http.ResponseWriter, r *http.Request) {
 		services.Log.WithField("error", err.Error()).Error("Error getting update playbook")
 		err := errors.NewInternalServerError()
 		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
+		if err := json.NewEncoder(w).Encode(&err); err != nil {
+			services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+		}
 		return
 	}
 	defer playbook.Close()
@@ -106,7 +117,9 @@ func GetUpdatePlaybook(w http.ResponseWriter, r *http.Request) {
 		services.Log.WithField("error", err.Error()).Error("Error reading the update playbook")
 		err := errors.NewInternalServerError()
 		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
+		if err := json.NewEncoder(w).Encode(&err); err != nil {
+			services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+		}
 		return
 	}
 }
@@ -123,7 +136,9 @@ func GetUpdates(w http.ResponseWriter, r *http.Request) {
 		}).Error("Error retrieving account")
 		err := errors.NewBadRequest(err.Error())
 		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
+		if err := json.NewEncoder(w).Encode(&err); err != nil {
+			services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+		}
 		return
 	}
 	// FIXME - need to sort out how to get this query to be against commit.account
@@ -134,11 +149,15 @@ func GetUpdates(w http.ResponseWriter, r *http.Request) {
 		}).Error("Error retrieving updates")
 		err := errors.NewBadRequest(err.Error())
 		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
+		if err := json.NewEncoder(w).Encode(&err); err != nil {
+			services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+		}
 		return
 	}
 
-	json.NewEncoder(w).Encode(&updates)
+	if err := json.NewEncoder(w).Encode(&updates); err != nil {
+		services.Log.WithField("error", updates).Error("Error while trying to encode")
+	}
 }
 
 // UpdatePostJSON contains the update structure for the device
@@ -161,7 +180,9 @@ func updateFromHTTP(w http.ResponseWriter, r *http.Request) (*models.UpdateTrans
 		}).Error("Error retrieving account")
 		err := errors.NewBadRequest(err.Error())
 		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
+		if err := json.NewEncoder(w).Encode(&err); err != nil {
+			services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+		}
 		return nil, err
 	}
 
@@ -219,6 +240,13 @@ func updateFromHTTP(w http.ResponseWriter, r *http.Request) (*models.UpdateTrans
 	// Get the models.Commit from the Commit ID passed in via JSON
 	update.Commit, err = services.CommitService.GetCommitByID(updateJSON.CommitID)
 	services.Log.WithField("commit", update.Commit).Debug("Commit retrieved from this update")
+
+	notify, errNotify := services.UpdateService.SendDeviceNotification(&update)
+	if errNotify != nil {
+		services.Log.WithField("message", errNotify.Error()).Error("Error to send notification")
+		services.Log.WithField("message", notify).Error("Notify Error")
+
+	}
 	update.DispatchRecords = []models.DispatchRecord{}
 	if err != nil {
 		services.Log.WithFields(log.Fields{
@@ -237,7 +265,15 @@ func updateFromHTTP(w http.ResponseWriter, r *http.Request) (*models.UpdateTrans
 	repo = &models.Repo{
 		Status: models.RepoStatusBuilding,
 	}
-	db.DB.Create(&repo)
+	result := db.DB.Create(&repo)
+	if result.Error != nil {
+		services.Log.WithField("error", result.Error.Error()).Debug("Result error")
+		err := errors.NewBadRequest(result.Error.Error())
+		w.WriteHeader(err.GetStatus())
+		if err := json.NewEncoder(w).Encode(&err); err != nil {
+			services.Log.WithField("error", result.Error.Error()).Error("Error while trying to encode")
+		}
+	}
 	update.Repo = repo
 	services.Log.WithFields(log.Fields{
 		"repoURL": repo.URL,
@@ -256,7 +292,9 @@ func updateFromHTTP(w http.ResponseWriter, r *http.Request) (*models.UpdateTrans
 				services.Log.WithField("error", err.Error()).Error("Device was not found in our database")
 				err := errors.NewBadRequest(err.Error())
 				w.WriteHeader(err.GetStatus())
-				json.NewEncoder(w).Encode(&err)
+				if err := json.NewEncoder(w).Encode(&err); err != nil {
+					services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+				}
 				return &models.UpdateTransaction{}, err
 			}
 			services.Log.WithFields(log.Fields{
@@ -264,12 +302,19 @@ func updateFromHTTP(w http.ResponseWriter, r *http.Request) (*models.UpdateTrans
 				"deviceUUID": device.ID,
 			}).Info("Creating a new device on the database")
 			updateDevice = &models.Device{
-				UUID: device.ID,
+				UUID:    device.ID,
+				Account: account,
 			}
-			db.DB.Create(&updateDevice)
+			if result := db.DB.Create(&updateDevice); result.Error != nil {
+				return nil, result.Error
+			}
 		}
 		updateDevice.RHCClientID = device.Ostree.RHCClientID
-		updateDevice.DesiredHash = update.Commit.OSTreeCommit
+		updateDevice.AvailableHash = update.Commit.OSTreeCommit
+		// update the device account if undefined
+		if updateDevice.Account == "" {
+			updateDevice.Account = account
+		}
 		result := db.DB.Save(&updateDevice)
 		if result.Error != nil {
 			return nil, result.Error
@@ -297,7 +342,9 @@ func updateFromHTTP(w http.ResponseWriter, r *http.Request) (*models.UpdateTrans
 						services.Log.WithField("error", err.Error()).Error("Error returning old commit for this ostree checksum")
 						err := errors.NewBadRequest(err.Error())
 						w.WriteHeader(err.GetStatus())
-						json.NewEncoder(w).Encode(&err)
+						if err := json.NewEncoder(w).Encode(&err); err != nil {
+							services.Log.WithField("error", err.Error()).Error("Error encoding error")
+						}
 						return &models.UpdateTransaction{}, err
 					}
 				}
@@ -313,7 +360,9 @@ func updateFromHTTP(w http.ResponseWriter, r *http.Request) (*models.UpdateTrans
 	if err := db.DB.Save(&update).Error; err != nil {
 		err := errors.NewBadRequest(err.Error())
 		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
+		if err := json.NewEncoder(w).Encode(&err); err != nil {
+			services.Log.WithField("error", err.Error()).Error("Error encoding error")
+		}
 		return nil, err
 	}
 	services.Log.WithField("updateID", update.ID).Info("Update has been created")
@@ -354,7 +403,9 @@ func AddUpdate(w http.ResponseWriter, r *http.Request) {
 	services.Log.WithField("updateID", update.ID).Info("Starting asynchronous update process")
 	go services.UpdateService.CreateUpdate(update.ID)
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(update)
+	if err := json.NewEncoder(w).Encode(update); err != nil {
+		services.Log.WithField("error", update).Error("Error while trying to encode")
+	}
 
 }
 
@@ -365,7 +416,10 @@ func GetUpdateByID(w http.ResponseWriter, r *http.Request) {
 		// Error set by UpdateCtx already
 		return
 	}
-	json.NewEncoder(w).Encode(update)
+	if err := json.NewEncoder(w).Encode(update); err != nil {
+		services := dependencies.ServicesFromContext(r.Context())
+		services.Log.WithField("error", update).Error("Error while trying to encode")
+	}
 }
 
 func getUpdate(w http.ResponseWriter, r *http.Request) *models.UpdateTransaction {
@@ -376,4 +430,27 @@ func getUpdate(w http.ResponseWriter, r *http.Request) *models.UpdateTransaction
 		return nil
 	}
 	return update
+}
+
+//SendNotificationForDevice TMP route to validate
+func SendNotificationForDevice(w http.ResponseWriter, r *http.Request) {
+	if update := getUpdate(w, r); update != nil {
+		services := dependencies.ServicesFromContext(r.Context())
+		notify, err := services.UpdateService.SendDeviceNotification(update)
+		if err != nil {
+			services.Log.WithField("error", err.Error()).Error("Failed to retry to send notification")
+			err := errors.NewInternalServerError()
+			err.SetTitle("Failed creating image")
+			w.WriteHeader(err.GetStatus())
+			if err := json.NewEncoder(w).Encode(&err); err != nil {
+				services.Log.WithField("error", err.Error()).Error("Error while trying to encode")
+			}
+			return
+		}
+		services.Log.WithField("StatusOK", http.StatusOK).Info("Writting Header")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(notify); err != nil {
+			services.Log.WithField("error", notify).Error("Error while trying to encode")
+		}
+	}
 }

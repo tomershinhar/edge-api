@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -25,9 +27,13 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"gorm.io/gorm"
+
+	clowder "github.com/redhatinsights/app-common-go/pkg/api/v1"
+	"gopkg.in/confluentinc/confluent-kafka-go.v1/kafka"
 )
 
 // WaitGroup is the waitg roup for pending image builds
+// FIXME: this no longer applies to images. move to devices
 var WaitGroup sync.WaitGroup
 
 // ImageServiceInterface defines the interface that helps handle
@@ -46,10 +52,14 @@ type ImageServiceInterface interface {
 	GetImageByOSTreeCommitHash(commitHash string) (*models.Image, error)
 	CheckImageName(name, account string) (bool, error)
 	RetryCreateImage(image *models.Image) error
+	ResumeCreateImage(id uint) error
 	GetMetadata(image *models.Image) (*models.Image, error)
 	SetFinalImageStatus(i *models.Image)
 	CheckIfIsLatestVersion(previousImage *models.Image) error
 	SetBuildingStatusOnImageToRetryBuild(image *models.Image) error
+	GetRollbackImage(image *models.Image) (*models.Image, error)
+	SendImageNotification(image *models.Image) (ImageNotification, error)
+	SetDevicesUpdateAvailabilityFromImageSet(account string, ImageSetID uint) error
 }
 
 // NewImageService gives a instance of the main implementation of a ImageServiceInterface
@@ -71,22 +81,93 @@ type ImageService struct {
 	RepoService  RepoServiceInterface
 }
 
+// ValidateAllImageReposAreFromAccount validates the account for Third Party Repositories
+func ValidateAllImageReposAreFromAccount(account string, repos []models.ThirdPartyRepo) error {
+
+	if account == "" {
+		return errors.NewBadRequest("repository information is not valid")
+	}
+	if len(repos) == 0 {
+		return nil
+	}
+	var ids []uint
+	for _, repo := range repos {
+		ids = append(ids, repo.ID)
+	}
+
+	var existingRepos []models.ThirdPartyRepo
+
+	if res := db.DB.Where(models.ThirdPartyRepo{Account: account}).Find(&existingRepos, ids); res.Error != nil {
+		return res.Error
+	}
+
+	return nil
+}
+
 // CreateImage creates an Image for an Account on Image Builder and on our database
 func (s *ImageService) CreateImage(image *models.Image, account string) error {
-	var imageSet models.ImageSet
-	imageSet.Account = account
-	imageSet.Name = image.Name
-	imageSet.Version = image.Version
-	set := db.DB.Create(&imageSet)
-	if set.Error == nil {
-		image.ImageSetID = &imageSet.ID
+
+	//Send Image creation to notification
+	notify, errNotify := s.SendImageNotification(image)
+	if errNotify != nil {
+		s.log.WithField("message", errNotify.Error()).Error("Error to send notification")
+		s.log.WithField("message", notify).Error("Notify Error")
+
 	}
-	image, err := s.ImageBuilder.ComposeCommit(image)
+	// Check for existing ImageSet and return if exists
+	// TODO: this routine needs to become a function under imagesets
+	var imageSetExists bool
+	var imageSetModel models.ImageSet
+	var imageSet models.ImageSet
+
+	// query to check if there are more than 0 matching imagesets
+	// NOTE: see fix below, we iterate over the DB twice if one exists
+	// just use the second query and return on first match
+	err := db.DB.Model(imageSetModel).
+		Select("count(*) > 0").
+		Where("name = ? AND account = ?", image.Name, account).
+		Find(&imageSetExists).
+		Error
+
+	// gorm error check
 	if err != nil {
 		return err
 	}
+
+	// requery to get imageset details and then return
+	// FIXME: this is leftover from previous functionality. Do one query or the other.
+	if imageSetExists {
+		result := db.DB.Where("name = ? AND account = ?", image.Name, account).First(&imageSet)
+		if result.Error != nil {
+			s.log.WithField("error", result.Error.Error()).Error("Error checking for previous image set existence")
+			return result.Error
+		}
+		s.log.WithField("imageSetName", image.Name).Error("ImageSet already exists, UpdateImage transaction expected and not CreateImage", image.Name)
+		return new(ImageSetAlreadyExists)
+	}
+
+	// Create a new imageset
+	// TODO: this should be a function under imagesets
+	imageSet.Account = account
+	imageSet.Name = image.Name
+
+	imageSet.Version = image.Version
+	set := db.DB.Create(&imageSet)
+	if set.Error != nil {
+		return set.Error
+	}
+	s.log.WithField("imageSetName", image.Name).Debug("Imageset created")
+
+	// create an image under the new imageset
 	image.Account = account
+	image.ImageSetID = &imageSet.ID
+	// make the initial call to Image Builder
+	image, err = s.ImageBuilder.ComposeCommit(image)
+	if err != nil {
+		return err
+	}
 	image.Commit.Account = account
+	// FIXME: Status below is already set in the call to ComposeCommit()
 	image.Commit.Status = models.ImageStatusBuilding
 	image.Status = models.ImageStatusBuilding
 	// TODO: Remove code when frontend is not using ImageType on the table
@@ -103,6 +184,10 @@ func (s *ImageService) CreateImage(image *models.Image, account string) error {
 		if tx.Error != nil {
 			return tx.Error
 		}
+	}
+
+	if err := ValidateAllImageReposAreFromAccount(account, image.ThirdPartyRepositories); err != nil {
+		return err
 	}
 	tx := db.DB.Create(&image.Commit)
 	if tx.Error != nil {
@@ -132,11 +217,13 @@ func (s *ImageService) UpdateImage(image *models.Image, previousImage *models.Im
 	// important: update the image imageSet for any previous image build status,
 	// otherwise image will be orphaned from its imageSet if previous build failed
 	image.ImageSetID = previousImage.ImageSetID
+	image.Account = previousImage.Account
 
 	if previousImage.Status == models.ImageStatusSuccess {
 		// Previous image was built successfully
 		var currentImageSet models.ImageSet
 		result := db.DB.Where("Id = ?", previousImage.ImageSetID).First(&currentImageSet)
+
 		if result.Error != nil {
 			s.log.WithField("error", result.Error.Error()).Error("Error retrieving the image set from parent image")
 			return result.Error
@@ -170,7 +257,6 @@ func (s *ImageService) UpdateImage(image *models.Image, previousImage *models.Im
 	if err != nil {
 		return err
 	}
-	image.Account = previousImage.Account
 	image.Commit.Account = previousImage.Account
 	image.Commit.Status = models.ImageStatusBuilding
 	image.Status = models.ImageStatusBuilding
@@ -189,6 +275,9 @@ func (s *ImageService) UpdateImage(image *models.Image, previousImage *models.Im
 			s.log.WithField("error", tx.Error.Error()).Error("Error creating installer")
 			return tx.Error
 		}
+	}
+	if err := ValidateAllImageReposAreFromAccount(image.Account, image.ThirdPartyRepositories); err != nil {
+		return err
 	}
 	tx := db.DB.Create(&image.Commit)
 	if tx.Error != nil {
@@ -211,20 +300,65 @@ func (s *ImageService) UpdateImage(image *models.Image, previousImage *models.Im
 }
 
 func (s *ImageService) postProcessInstaller(image *models.Image) error {
-	s.log.Debug("Post processing installer")
+	s.log.Debug("Post processing the installer for the image")
 	for {
 		i, err := s.UpdateImageStatus(image)
 		if err != nil {
 			s.log.WithField("error", err.Error()).Error("Update image status error")
 			return err
 		}
+
+		// the Image Builder status has changed from BUILDING
 		if i.Installer.Status != models.ImageStatusBuilding {
+
+			// if clowder is enabled, send an event on Image Build completion
+			// TODO: break this out into its own function
+			if clowder.IsClowderEnabled() {
+				// get the list of brokers from the config
+				brokers := make([]string, len(clowder.LoadedConfig.Kafka.Brokers))
+				for i, b := range clowder.LoadedConfig.Kafka.Brokers {
+					brokers[i] = fmt.Sprintf("%s:%d", b.Hostname, *b.Port)
+				}
+
+				topic := "platform.edge.fleetmgmt.image-build"
+
+				// Create Producer instance
+				p, err := kafka.NewProducer(&kafka.ConfigMap{
+					"bootstrap.servers": brokers[0]})
+				if err != nil {
+					s.log.WithField("error", err).Error("Failed to create producer")
+					os.Exit(1)
+				}
+
+				// assemble the message to be sent
+				// TODO: formalize message formats
+				recordKey := "postProcessInstaller"
+				recordValue, _ := json.Marshal(&image)
+				s.log.WithField("message", recordValue).Debug("Preparing record for producer")
+				perr := p.Produce(&kafka.Message{
+					TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+					Key:            []byte(recordKey),
+					Value:          []byte(recordValue),
+				}, nil)
+				if perr != nil {
+					s.log.Error("Error sending message")
+				}
+
+				// Wait for all messages to be delivered
+				p.Flush(15 * 1000)
+				p.Close()
+
+				s.log.WithField("topic", topic).Debug("postProcessInstaller message was produced to topic")
+			}
+
 			break
 		}
 		time.Sleep(1 * time.Minute)
 	}
 
 	if image.Installer.Status == models.ImageStatusSuccess {
+		// Post process the installer ISO
+		//	User, kickstart, checksum, etc.
 		err := s.AddUserInfo(image)
 		if err != nil {
 			s.log.WithField("error", err.Error()).Error("Kickstart file injection failed")
@@ -235,11 +369,12 @@ func (s *ImageService) postProcessInstaller(image *models.Image) error {
 	// It updates the status across the image and not just the installer
 	s.log.Debug("Setting final image status")
 	s.SetFinalImageStatus(image)
-	s.log.Debug("Post processing image with installer is done")
+	s.log.WithField("status", image.Status).Debug("Processing image installer is done")
 	return nil
 }
+
 func (s *ImageService) postProcessCommit(image *models.Image) error {
-	s.log.Debug("Post processing commit")
+	s.log.Debug("Processing image build commit")
 	for {
 		i, err := s.UpdateImageStatus(image)
 		if err != nil {
@@ -247,6 +382,48 @@ func (s *ImageService) postProcessCommit(image *models.Image) error {
 			return err
 		}
 		if i.Commit.Status != models.ImageStatusBuilding {
+
+			// if clowder is enabled, send an event on Image Build completion
+			// TODO: break this out into its own function
+			if clowder.IsClowderEnabled() {
+				// get the list of brokers from the config
+				brokers := make([]string, len(clowder.LoadedConfig.Kafka.Brokers))
+				for i, b := range clowder.LoadedConfig.Kafka.Brokers {
+					brokers[i] = fmt.Sprintf("%s:%d", b.Hostname, *b.Port)
+				}
+
+				topic := "platform.edge.fleetmgmt.image-build"
+
+				// Create Producer instance
+				p, err := kafka.NewProducer(&kafka.ConfigMap{
+					"bootstrap.servers": brokers[0]})
+				if err != nil {
+					s.log.WithField("error", err).Error("Failed to create producer")
+					os.Exit(1)
+				}
+
+				// assemble the message to be sent
+				// TODO: formalize message formats
+				recordKey := "postProcessCommit"
+				recordValue, _ := json.Marshal(&image)
+				s.log.WithField("message", recordValue).Debug("Preparing record for producer")
+				// send the message
+				perr := p.Produce(&kafka.Message{
+					TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+					Key:            []byte(recordKey),
+					Value:          []byte(recordValue),
+				}, nil)
+				if perr != nil {
+					s.log.Error("Error sending message")
+				}
+
+				// Wait for all messages to be delivered
+				p.Flush(15 * 1000)
+				p.Close()
+
+				s.log.WithField("topic", topic).Debug("postProcessCommit message was produced to topic")
+			}
+
 			break
 		}
 		time.Sleep(1 * time.Minute)
@@ -260,6 +437,7 @@ func (s *ImageService) postProcessCommit(image *models.Image) error {
 			return err
 		}
 
+		// Create the repo for the image
 		_, err = s.CreateRepoForImage(image)
 		if err != nil {
 			s.log.WithField("error", err.Error()).Error("Failed creating repo for image")
@@ -270,9 +448,9 @@ func (s *ImageService) postProcessCommit(image *models.Image) error {
 		image.Installer = nil
 		s.log.Debug("Setting final image status - no installer to create")
 		s.SetFinalImageStatus(image)
-		s.log.Debug("Post processing image is done - no installer to create")
+		s.log.Debug("Processing image is done - no installer to create")
 	}
-	s.log.Debug("Post processing commit is done")
+	s.log.Debug("Processing commit is done")
 	return nil
 }
 
@@ -313,62 +491,98 @@ func (s *ImageService) SetFinalImageStatus(i *models.Image) {
 
 	tx := db.DB.Save(i)
 	if tx.Error != nil {
-		s.log.WithField("error", tx.Error.Error()).Fatal("Couldn't set final image status")
+		s.log.WithField("error", tx.Error.Error()).Error("Couldn't set final image status")
+	}
+	s.log.WithField("status", i.Status).Debug("Setting final image status")
+
+	if i.ImageSetID != nil && i.Status == models.ImageStatusSuccess {
+		if err := s.SetDevicesUpdateAvailabilityFromImageSet(i.Account, *i.ImageSetID); err != nil {
+			s.log.WithField("error", err.Error()).Error("Error while setting devices update availability flag")
+		}
 	}
 }
 
-// Every log message in this method already has commit id and image id injected
 func (s *ImageService) postProcessImage(id uint) {
-	s.log.Debug("Post processing image")
-	var i *models.Image
-	db.DB.Joins("Commit").Joins("Installer").First(&i, id)
+	// NOTE: Every log message in this method already has commit id and image id injected
 
-	WaitGroup.Add(1) // Processing one image
+	s.log.Debug("Processing image build")
+	var i *models.Image
+
+	// setup a context and signal for SIGTERM
+	ctx := context.Background()
+	intctx, intcancel := context.WithCancel(ctx)
+	sigint := make(chan os.Signal, 1)
+	signal.Notify(sigint, os.Interrupt, syscall.SIGTERM)
+
+	// this will run at the end of postProcessImage to tidy up signal and context
 	defer func() {
-		WaitGroup.Done() // Done with one image (successfully or not)
-		s.log.Debug("Done with one image - successfully or not")
-		if err := recover(); err != nil {
-			s.log.Fatalf("Error recovering post process image goroutine")
+		s.log.WithField("imageID", id).Debug("Stopping the interrupt context and sigint signal")
+		signal.Stop(sigint)
+		intcancel()
+	}()
+	// This runs alongside and blocks on either a signal or normal completion from defer above
+	// 	if an interrupt, set image to INTERRUPTED in database
+	go func() {
+		s.log.WithField("imageID", id).Debug("Running the select go routine to handle completion and interrupts")
+
+		select {
+		case <-sigint:
+			// we caught an interrupt. Mark the image as interrupted.
+			s.log.WithField("imageID", id).Debug("Select case SIGINT interrupt has been triggered")
+
+			tx := db.DB.Debug().Model(&models.Image{}).Where("ID = ?", id).Update("Status", models.ImageStatusInterrupted)
+			s.log.WithField("imageID", id).Debug("Image updated with interrupted status")
+			if tx.Error != nil {
+				s.log.WithField("error", tx.Error.Error()).Error("Error updating image")
+			}
+
+			// cancel the context
+			intcancel()
+			return
+		case <-intctx.Done():
+			// Things finished normally and reached the defer defined above.
+			s.log.WithField("imageID", id).Info("Select case context intctx done has been triggered")
 		}
 	}()
-	go func(i *models.Image) {
-		sigint := make(chan os.Signal, 1)
-		signal.Notify(sigint, os.Interrupt, syscall.SIGTERM)
-		sig := <-sigint
-		// Reload image to get updated status
-		db.DB.Joins("Commit").Joins("Installer").First(&i, i.ID)
-		if i.Status == models.ImageStatusBuilding {
-			s.log.WithField("signal", sig).Info("Captured signal marking image as error", sig)
-			s.SetErrorStatusOnImage(nil, i)
-			WaitGroup.Done()
-		}
-	}(i)
 
+	// business as usual from here to end of block
+	db.DB.Debug().Joins("Commit").Joins("Installer").First(&i, id)
+
+	// Request a commit from Image Builder for the image
+	s.log.WithField("imageID", i.ID).Debug("Creating a commit for this image")
 	err := s.postProcessCommit(i)
 	if err != nil {
 		s.SetErrorStatusOnImage(err, i)
-		s.log.WithField("error", err.Error()).Fatal("Failed creating commit for image")
+		s.log.WithField("error", err.Error()).Error("Failed creating commit for image")
 	}
 
 	if i.Commit.Status == models.ImageStatusSuccess {
 		s.log.Debug("Commit is successful")
+
+		// Request an installer ISO from Image Builder for the image
 		if i.HasOutputType(models.ImageTypeInstaller) {
+			s.log.WithField("imageID", i.ID).Debug("Creating an installer for this image")
 			i, c, err := s.CreateInstallerForImage(i)
+			/* CreateInstallerForImage is also called directly from an endpoint.
+			If called from the endpoint it will not block
+				the caller returns the channel output to _
+			Here, we catch the channel with c and use it in the next if--so it blocks.
+			*/
 			if c != nil {
 				err = <-c
 			}
 			if err != nil {
 				s.SetErrorStatusOnImage(err, i)
-				s.log.WithField("error", err.Error()).Fatal("Failed creating installer for image")
+				s.log.WithField("error", err.Error()).Error("Failed creating installer for image")
 			}
 		}
 	}
-	s.log.Debug("Post processing image is done")
+	s.log.WithField("status", i.Status).Debug("Processing image build is done")
 }
 
 // CreateRepoForImage creates the OSTree repo to host that image
 func (s *ImageService) CreateRepoForImage(i *models.Image) (*models.Repo, error) {
-	s.log.Infof("Creating OSTree repo.")
+	s.log.Info("Creating OSTree repo for image")
 	repo := &models.Repo{
 		Status: models.RepoStatusBuilding,
 	}
@@ -401,27 +615,27 @@ func (s *ImageService) CreateRepoForImage(i *models.Image) (*models.Repo, error)
 func (s *ImageService) SetErrorStatusOnImage(err error, i *models.Image) {
 	if i.Status != models.ImageStatusError {
 		i.Status = models.ImageStatusError
-		tx := db.DB.Save(i)
+		tx := db.DB.Debug().Save(i)
 		s.log.Debug("Image saved with error status")
 		if tx.Error != nil {
 			s.log.WithField("error", tx.Error.Error()).Error("Error saving image")
 		}
 		if i.Commit != nil {
 			i.Commit.Status = models.ImageStatusError
-			tx := db.DB.Save(i.Commit)
+			tx := db.DB.Debug().Save(i.Commit)
 			if tx.Error != nil {
 				s.log.WithField("error", tx.Error.Error()).Error("Error saving commit")
 			}
 		}
 		if i.Installer != nil {
 			i.Installer.Status = models.ImageStatusError
-			tx := db.DB.Save(i.Installer)
+			tx := db.DB.Debug().Save(i.Installer)
 			if tx.Error != nil {
 				s.log.WithField("error", tx.Error.Error()).Error("Error saving installer")
 			}
 		}
 		if err != nil {
-			s.log.WithField("error", tx.Error.Error()).Fatal("Error setting image final status")
+			s.log.WithField("error", err.Error()).Error("Error setting image final status")
 		}
 	}
 }
@@ -445,16 +659,19 @@ func (s *ImageService) AddUserInfo(image *models.Image) error {
 		return fmt.Errorf("error downloading ISO file :: %s", err.Error())
 	}
 
+	s.log.Debug("Adding SSH Key to kickstart file...")
 	err = s.addSSHKeyToKickstart(sshKey, username, kickstart)
 	if err != nil {
 		return fmt.Errorf("error adding ssh key to kickstart file :: %s", err.Error())
 	}
 
+	s.log.Debug("Injecting the kickstart into image...")
 	err = s.exeInjectionScript(kickstart, imageName, image.ID)
 	if err != nil {
 		return fmt.Errorf("error execuiting fleetkick script :: %s", err.Error())
 	}
 
+	s.log.Debug("Calculating the checksum for the ISO image...")
 	err = s.calculateChecksum(imageName, image)
 	if err != nil {
 		return fmt.Errorf("error calculating checksum for ISO :: %s", err.Error())
@@ -465,11 +682,13 @@ func (s *ImageService) AddUserInfo(image *models.Image) error {
 		return fmt.Errorf("error uploading ISO :: %s", err.Error())
 	}
 
+	s.log.Debug("Cleaning up temporary files...")
 	err = s.cleanFiles(kickstart, imageName, image.ID)
 	if err != nil {
 		return fmt.Errorf("error cleaning files :: %s", err.Error())
 	}
 
+	s.log.Debug("Post installer ISO processing complete")
 	return nil
 }
 
@@ -506,7 +725,10 @@ func (s *ImageService) addSSHKeyToKickstart(sshKey string, username string, kick
 		s.log.WithField("error", err.Error()).Error("Failed adding username and sshkey on image")
 		return err
 	}
-	file.Close()
+	if err := file.Close(); err != nil {
+		s.log.WithField("error", err.Error()).Error("Failed closing file")
+		return err
+	}
 
 	return nil
 }
@@ -514,15 +736,19 @@ func (s *ImageService) addSSHKeyToKickstart(sshKey string, username string, kick
 // Download created ISO into the file system.
 func (s *ImageService) downloadISO(isoName string, url string) error {
 
-	s.log.WithField("isoName", isoName).Debug("Creating iso")
+	s.log.WithField("isoName", isoName).Debug("Creating ISO file")
 	iso, err := os.Create(isoName)
 	if err != nil {
 		return err
 	}
-	defer iso.Close()
+	defer func() {
+		if err := iso.Close(); err != nil {
+			s.log.WithField("error", err.Error()).Error("Error closing file")
+		}
+	}()
 
-	s.log.WithField("url", url).Debug("Downloading iso")
-	res, err := http.Get(url)
+	s.log.WithField("url", url).Debug("Downloading ISO...")
+	res, err := http.Get(url) // #nosec G107
 	if err != nil {
 		return err
 	}
@@ -530,7 +756,7 @@ func (s *ImageService) downloadISO(isoName string, url string) error {
 
 	_, err = io.Copy(iso, res.Body)
 	if err != nil {
-		s.log.WithField("error", err.Error()).Error("Failed downloading iso")
+		s.log.WithField("error", err.Error()).Error("Failed downloading ISO")
 		return err
 	}
 
@@ -541,6 +767,7 @@ func (s *ImageService) downloadISO(isoName string, url string) error {
 func (s *ImageService) uploadISO(image *models.Image, imageName string) error {
 
 	uploadPath := fmt.Sprintf("%s/isos/%s.iso", image.Account, image.Name)
+	s.log.WithField("path", uploadPath).Debug("Uploading ISO...")
 	filesService := NewFilesService(s.log)
 	url, err := filesService.GetUploader().UploadFile(imageName, uploadPath)
 
@@ -636,13 +863,18 @@ func (s *ImageService) CheckImageName(name, account string) (bool, error) {
 func (s *ImageService) exeInjectionScript(kickstart string, image string, imageID uint) error {
 	fleetBashScript := "/usr/local/bin/fleetkick.sh"
 	workDir := fmt.Sprintf("/var/tmp/workdir%d", imageID)
-	err := os.Mkdir(workDir, 0755)
+	err := os.Mkdir(workDir, 0750)
 	if err != nil {
 		s.log.WithField("error", err.Error()).Error("Error giving permissions to execute fleetkick")
 		return err
 	}
 
-	cmd := exec.Command(fleetBashScript, kickstart, image, image, workDir)
+	cmd := &exec.Cmd{
+		Path: fleetBashScript,
+		Args: []string{
+			fleetBashScript, kickstart, image, image, workDir,
+		},
+	}
 	output, err := cmd.Output()
 	if err != nil {
 		s.log.WithField("error", err.Error()).Error("Error executing fleetkick")
@@ -656,12 +888,16 @@ func (s *ImageService) exeInjectionScript(kickstart string, image string, imageI
 func (s *ImageService) calculateChecksum(isoPath string, image *models.Image) error {
 	s.log.WithField("isoPath", isoPath).Info("Calculating sha256 checksum for ISO")
 
-	fh, err := os.Open(isoPath)
+	fh, err := os.Open(filepath.Clean(isoPath))
 	if err != nil {
 		s.log.WithField("error", err.Error()).Error("Error opening ISO file")
 		return err
 	}
-	defer fh.Close()
+	defer func() {
+		if err := fh.Close(); err != nil {
+			s.log.WithField("error", err.Error()).Error("Error closing file")
+		}
+	}()
 
 	sumCalculator := sha256.New()
 	_, err = io.Copy(sumCalculator, fh)
@@ -744,9 +980,9 @@ func (s *ImageService) GetImageByID(imageID string) (*models.Image, error) {
 		s.log.WithField("error", err).Debug("Request related error - ID is not integer")
 		return nil, new(IDMustBeInteger)
 	}
-	result := db.DB.Preload("Commit.Repo").Preload("Commit.InstalledPackages").Where("images.account = ?", account).Joins("Commit").First(&image, id)
+	result := db.DB.Preload("Commit.Repo").Preload("Commit.InstalledPackages").Preload("CustomPackages").Where("images.account = ?", account).Joins("Commit").First(&image, id)
 	if result.Error != nil {
-		s.log.WithField("error", err).Debug("Request related error - image is not found")
+		s.log.WithField("error", result.Error.Error()).Debug("Request related error - image is not found")
 		return nil, new(ImageNotFoundError)
 	}
 	return s.addImageExtraData(&image)
@@ -754,21 +990,21 @@ func (s *ImageService) GetImageByID(imageID string) (*models.Image, error) {
 
 // GetImageByOSTreeCommitHash retrieves an image by its ostree commit hash
 func (s *ImageService) GetImageByOSTreeCommitHash(commitHash string) (*models.Image, error) {
-	s.log.Info("Getting image by OSTreeHash")
+	s.log.WithField("ostreeHash", commitHash).Info("Getting image by OSTreeHash")
 	var image models.Image
 	account, err := common.GetAccountFromContext(s.ctx)
 	if err != nil {
 		s.log.Error("Error retreving account")
 		return nil, new(AccountNotSet)
 	}
-	result := db.DB.Where("images.account = ? and os_tree_commit = ?", account, commitHash).Joins("Commit").First(&image)
+	result := db.DB.Where("images.account = ?", account).Joins("JOIN commits ON commits.id = images.commit_id AND commits.os_tree_commit = ?", commitHash).Joins("Installer").Preload("Packages").Preload("Commit.InstalledPackages").Preload("Commit.Repo").First(&image)
 	if result.Error != nil {
 		s.log.WithField("error", result.Error).Error("Error retrieving image by OSTreeHash")
 		return nil, new(ImageNotFoundError)
 	}
 	s.log = s.log.WithField("imageID", image.ID)
 	s.log.Info("Image successfully retrieved by its OSTreeHash")
-	return s.addImageExtraData(&image)
+	return &image, nil
 }
 
 // RetryCreateImage retries the whole post process of the image creation
@@ -789,31 +1025,58 @@ func (s *ImageService) RetryCreateImage(image *models.Image) error {
 	return nil
 }
 
+// ResumeCreateImage retries the whole post process of the image creation
+func (s *ImageService) ResumeCreateImage(id uint) error {
+	// TODO: make this skip commit and installer if already complete
+	// get the image data from database
+	var image *models.Image
+	db.DB.Debug().Joins("Commit").Joins("Installer").First(&image, id)
+	//image, _ = s.GetImageByID(fmt.Sprint(id))
+	s.log = s.log.WithFields(log.Fields{"imageID": image.ID, "commitID": image.Commit.ID})
+	s.log.Debug("Resuming the image build...")
+	/* // recompose commit
+	image, err := s.ImageBuilder.ComposeCommit(image)
+	if err != nil {
+		s.log.WithField("error", err.Error()).Error("Failed recomposing commit")
+		return err
+	} */
+	err := s.SetBuildingStatusOnImageToRetryBuild(image)
+	if err != nil {
+		s.log.WithField("error", err.Error()).Error("Failed setting image status")
+		return err
+	}
+	go s.postProcessImage(image.ID)
+	return nil
+}
+
 // SetBuildingStatusOnImageToRetryBuild set building status on image so we can try the build
 func (s *ImageService) SetBuildingStatusOnImageToRetryBuild(image *models.Image) error {
+	s.log.Debug("Setting image status")
 	image.Status = models.ImageStatusBuilding
 	if image.Commit != nil {
+		s.log.Debug("Setting commit status")
 		image.Commit.Status = models.ImageStatusBuilding
 		// Repo will be recreated from scratch, its safer and simpler as this stage
 		if image.Commit.Repo != nil {
+			s.log.Debug("Reset repo")
 			image.Commit.Repo = nil
-			tx := db.DB.Save(image.Commit.Repo)
-			if tx.Error != nil {
-				return tx.Error
-			}
 		}
+		s.log.Debug("Saving commit status")
 		tx := db.DB.Save(image.Commit)
 		if tx.Error != nil {
 			return tx.Error
 		}
 	}
 	if image.Installer != nil {
+		s.log.Debug("Setting installer status")
 		image.Installer.Status = models.ImageStatusCreated
+		s.log.Debug("Saving installer status")
 		tx := db.DB.Save(image.Installer)
 		if tx.Error != nil {
 			return tx.Error
 		}
 	}
+	s.log.Debug("Saving image status")
 	tx := db.DB.Save(image)
 	if tx.Error != nil {
 		return tx.Error
@@ -868,11 +1131,23 @@ func (s *ImageService) GetUpdateInfo(image models.Image) ([]models.ImageUpdateAv
 		return nil, nil
 	}
 	for _, upd := range images {
+		upd := upd // this will prevent implicit memory aliasing in the loop
 		db.DB.First(&upd.Commit, upd.CommitID)
-		db.DB.Model(&upd.Commit).Association("InstalledPackages").Find(&upd.Commit.InstalledPackages)
-		db.DB.Model(&upd).Association("Packages").Find(&upd.Packages)
+		if err := db.DB.Model(&upd.Commit).Association("InstalledPackages").Find(&upd.Commit.InstalledPackages); err != nil {
+			s.log.WithField("error", err.Error()).Error("Error retrieving installed packages")
+			return nil, err
+		}
+		if err := db.DB.Model(&upd).Association("Packages").Find(&upd.Packages); err != nil {
+			s.log.WithField("error", err.Error()).Error("Error retrieving updated packages")
+			return nil, err
+		}
+
+		if err := db.DB.Model(&upd).Association("CustomPackages").Find(&upd.CustomPackages); err != nil {
+			s.log.WithField("error", err.Error()).Error("Error retrieving updated CustomPackages")
+			return nil, err
+		}
 		var delta models.ImageUpdateAvailable
-		diff := getDiffOnUpdate(image, upd)
+		diff := GetDiffOnUpdate(image, upd)
 		upd.Commit.InstalledPackages = nil // otherwise the frontend will get the whole list of installed packages
 		delta.Image = upd
 		delta.PackageDiff = diff
@@ -893,7 +1168,7 @@ func (s *ImageService) GetMetadata(image *models.Image) (*models.Image, error) {
 	return image, nil
 }
 
-// CreateInstallerForImage creates a installer given an existent iamge
+// CreateInstallerForImage creates a installer given an existing image
 func (s *ImageService) CreateInstallerForImage(image *models.Image) (*models.Image, chan error, error) {
 	s.log.Debug("Creating installer for image")
 	c := make(chan error)
@@ -919,4 +1194,138 @@ func (s *ImageService) CreateInstallerForImage(image *models.Image) (*models.Ima
 		c <- err
 	}(c)
 	return image, c, nil
+}
+
+// GetRollbackImage returns the previous image from the image set in case of a rollback
+func (s *ImageService) GetRollbackImage(image *models.Image) (*models.Image, error) {
+	s.log.Info("Getting rollback image")
+	var rollback models.Image
+	account, err := common.GetAccountFromContext(s.ctx)
+	if err != nil {
+		s.log.Error("Error retreving account")
+		return nil, new(AccountNotSet)
+	}
+	result := db.DB.Joins("Commit").Joins("Installer").Preload("Packages").Preload("CustomPackages").Preload("Commit.InstalledPackages").Preload("Commit.Repo").Where(&models.Image{ImageSetID: image.ImageSetID, Account: account}).Last(&rollback, "images.id < ?", image.ID)
+	if result.Error != nil {
+		s.log.WithField("error", result.Error).Error("Error retrieving rollback image")
+		return nil, new(ImageNotFoundError)
+	}
+	s.log = s.log.WithField("imageID", image.ID)
+	s.log.Info("Rollback image successfully retrieved")
+	return &rollback, nil
+}
+
+// SendImageNotification connects to platform.notifications.ingress on image topic
+func (s *ImageService) SendImageNotification(i *models.Image) (ImageNotification, error) {
+	s.log.WithField("message", i).Info("SendImageNotification::Starts")
+	var notify ImageNotification
+	notify.Version = NotificationConfigVersion
+	notify.Bundle = NotificationConfigBundle
+	notify.Application = NotificationConfigApplication
+	notify.EventType = NotificationConfigEventTypeImage
+	notify.Timestamp = time.Now().Format(time.RFC3339)
+
+	if clowder.IsClowderEnabled() {
+		var users []string
+		var events []EventNotification
+		var event EventNotification
+		var recipients []RecipientNotification
+		var recipient RecipientNotification
+		brokers := make([]string, len(clowder.LoadedConfig.Kafka.Brokers))
+
+		for i, b := range clowder.LoadedConfig.Kafka.Brokers {
+			brokers[i] = fmt.Sprintf("%s:%d", b.Hostname, *b.Port)
+			fmt.Println(brokers[i])
+		}
+
+		topic := NotificationTopic
+
+		// Create Producer instance
+		p, err := kafka.NewProducer(&kafka.ConfigMap{
+			"bootstrap.servers": brokers[0]})
+		if err != nil {
+			s.log.WithField("message", err.Error()).Error("producer")
+			os.Exit(1)
+		}
+
+		type metadata struct {
+			metaMap map[string]string
+		}
+		emptyJSON := metadata{
+			metaMap: make(map[string]string),
+		}
+
+		event.Metadata = emptyJSON.metaMap
+
+		event.Payload = fmt.Sprintf("{  \"ImageId\" : \"%v\"}", i.ID)
+		events = append(events, event)
+
+		recipient.IgnoreUserPreferences = false
+		recipient.OnlyAdmins = false
+		users = append(users, NotificationConfigUser)
+		recipient.Users = users
+		recipients = append(recipients, recipient)
+
+		notify.Account = i.Account
+		notify.Context = fmt.Sprintf("{  \"ImageName\" : \"%v\"}", i.Name)
+		notify.Events = events
+		notify.Recipients = recipients
+
+		// assemble the message to be sent
+		recordKey := "ImageCreationStarts"
+		recordValue, _ := json.Marshal(notify)
+
+		s.log.WithField("message", recordValue).Info("Preparing record for producer")
+
+		// send the message
+		perr := p.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+			Key:            []byte(recordKey),
+			Value:          []byte(recordValue),
+		}, nil)
+
+		if perr != nil {
+			s.log.WithField("message", perr.Error()).Error("Error on produce")
+			return notify, err
+		}
+		p.Close()
+		s.log.WithField("message", topic).Info("SendNotification message was produced to topic")
+		fmt.Printf("SendNotification message was produced to topic %s!\n", topic)
+		return notify, nil
+	}
+	return notify, nil
+}
+
+// SetDevicesUpdateAvailabilityFromImageSet set whether updates available or not for all devices that use images of imageSet.
+func (s *ImageService) SetDevicesUpdateAvailabilityFromImageSet(account string, ImageSetID uint) error {
+	logger := s.log.WithFields(log.Fields{"account": account, "image_set": ImageSetID, "context": "SetDevicesUpdateAvailabilityFromImageSet"})
+
+	// get the last image with success status
+	var lastImage models.Image
+	if result := db.DB.Where("account = ? AND image_set_id = ? AND status = ?",
+		account, ImageSetID, models.ImageStatusSuccess).Order("created_at DESC").First(&lastImage); result.Error != nil {
+		return result.Error
+	}
+
+	// update all devices with last image that has update_available=true to update_available=false
+	if result := db.DB.Model(&models.Device{}).
+		Where("account = ? AND update_available = ? AND image_id = ? ", account, true, lastImage.ID).
+		UpdateColumn("update_available", false); result.Error != nil {
+		logger.WithField("error", result.Error).Error("Error occurred while updating device update_available")
+		return result.Error
+	}
+
+	// Create priorImagesSubQuery query for all successfully created images prior to lastImage
+	priorImagesSubQuery := db.DB.Model(&models.Image{}).Select("id").Where("account = ? AND image_set_id = ? AND status = ? AND created_at < ?",
+		account, ImageSetID, models.ImageStatusSuccess, lastImage.CreatedAt)
+
+	// Update all devices with prior images that has update_available=false to update_available=true
+	if result := db.DB.Model(&models.Device{}).
+		Where("account = ? AND update_available = ? AND image_id IN (?) ", account, false, priorImagesSubQuery).
+		UpdateColumn("update_available", true); result.Error != nil {
+		logger.WithField("error", result.Error).Error("Error occurred when updating account devices update_available")
+		return result.Error
+	}
+
+	return nil
 }

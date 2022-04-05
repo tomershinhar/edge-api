@@ -183,6 +183,21 @@ func (mr *MockImageServiceInterfaceMockRecorder) GetMetadata(image interface{}) 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMetadata", reflect.TypeOf((*MockImageServiceInterface)(nil).GetMetadata), image)
 }
 
+// GetRollbackImage mocks base method.
+func (m *MockImageServiceInterface) GetRollbackImage(image *models.Image) (*models.Image, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetRollbackImage", image)
+	ret0, _ := ret[0].(*models.Image)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetRollbackImage indicates an expected call of GetRollbackImage.
+func (mr *MockImageServiceInterfaceMockRecorder) GetRollbackImage(image interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetRollbackImage", reflect.TypeOf((*MockImageServiceInterface)(nil).GetRollbackImage), image)
+}
+
 // GetUpdateInfo mocks base method.
 func (m *MockImageServiceInterface) GetUpdateInfo(image models.Image) ([]models.ImageUpdateAvailable, error) {
 	m.ctrl.T.Helper()
@@ -196,6 +211,20 @@ func (m *MockImageServiceInterface) GetUpdateInfo(image models.Image) ([]models.
 func (mr *MockImageServiceInterfaceMockRecorder) GetUpdateInfo(image interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetUpdateInfo", reflect.TypeOf((*MockImageServiceInterface)(nil).GetUpdateInfo), image)
+}
+
+// ResumeCreateImage mocks base method.
+func (m *MockImageServiceInterface) ResumeCreateImage(id uint) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ResumeCreateImage", id)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ResumeCreateImage indicates an expected call of ResumeCreateImage.
+func (mr *MockImageServiceInterfaceMockRecorder) ResumeCreateImage(id interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ResumeCreateImage", reflect.TypeOf((*MockImageServiceInterface)(nil).ResumeCreateImage), id)
 }
 
 // RetryCreateImage mocks base method.
@@ -212,6 +241,21 @@ func (mr *MockImageServiceInterfaceMockRecorder) RetryCreateImage(image interfac
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RetryCreateImage", reflect.TypeOf((*MockImageServiceInterface)(nil).RetryCreateImage), image)
 }
 
+// SendImageNotification mocks base method.
+func (m *MockImageServiceInterface) SendImageNotification(image *models.Image) (services.ImageNotification, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SendImageNotification", image)
+	ret0, _ := ret[0].(services.ImageNotification)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SendImageNotification indicates an expected call of SendImageNotification.
+func (mr *MockImageServiceInterfaceMockRecorder) SendImageNotification(image interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SendImageNotification", reflect.TypeOf((*MockImageServiceInterface)(nil).SendImageNotification), image)
+}
+
 // SetBuildingStatusOnImageToRetryBuild mocks base method.
 func (m *MockImageServiceInterface) SetBuildingStatusOnImageToRetryBuild(image *models.Image) error {
 	m.ctrl.T.Helper()
@@ -224,6 +268,20 @@ func (m *MockImageServiceInterface) SetBuildingStatusOnImageToRetryBuild(image *
 func (mr *MockImageServiceInterfaceMockRecorder) SetBuildingStatusOnImageToRetryBuild(image interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetBuildingStatusOnImageToRetryBuild", reflect.TypeOf((*MockImageServiceInterface)(nil).SetBuildingStatusOnImageToRetryBuild), image)
+}
+
+// SetDevicesUpdateAvailabilityFromImageSet mocks base method.
+func (m *MockImageServiceInterface) SetDevicesUpdateAvailabilityFromImageSet(account string, ImageSetID uint) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SetDevicesUpdateAvailabilityFromImageSet", account, ImageSetID)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// SetDevicesUpdateAvailabilityFromImageSet indicates an expected call of SetDevicesUpdateAvailabilityFromImageSet.
+func (mr *MockImageServiceInterfaceMockRecorder) SetDevicesUpdateAvailabilityFromImageSet(account, ImageSetID interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetDevicesUpdateAvailabilityFromImageSet", reflect.TypeOf((*MockImageServiceInterface)(nil).SetDevicesUpdateAvailabilityFromImageSet), account, ImageSetID)
 }
 
 // SetErrorStatusOnImage mocks base method.

@@ -1,5 +1,7 @@
 package services
 
+import "errors"
+
 // DeviceNotFoundError indicates the device was not found
 type DeviceNotFoundError struct{}
 
@@ -48,3 +50,77 @@ type ImageVersionAlreadyExists struct{}
 func (e *ImageVersionAlreadyExists) Error() string {
 	return "updated image version already exists"
 }
+
+// DeviceGroupNotFound indicates the Third Party Repository was not found
+type DeviceGroupNotFound struct{}
+
+func (e *DeviceGroupNotFound) Error() string {
+	return "device group was not found"
+}
+
+// ImageSetAlreadyExists indicates the ImageSet attempting to be created already exists
+type ImageSetAlreadyExists struct{}
+
+func (e *ImageSetAlreadyExists) Error() string {
+	return "image set already exists"
+}
+
+// DeviceGroupAccountDevicesNotFound indicates that devices not found amonf the device group account
+type DeviceGroupAccountDevicesNotFound struct{}
+
+func (e *DeviceGroupAccountDevicesNotFound) Error() string {
+	return "devices not found among the device group account"
+
+}
+
+// DeviceGroupDevicesNotFound indicates that devices not found in the device group collection
+type DeviceGroupDevicesNotFound struct{}
+
+func (e *DeviceGroupDevicesNotFound) Error() string {
+	return "devices not found in device group"
+}
+
+// DeviceGroupAccountOrIDUndefined indicates that device group account or ID was not supplied
+type DeviceGroupAccountOrIDUndefined struct{}
+
+func (e *DeviceGroupAccountOrIDUndefined) Error() string {
+	return "account or deviceGroupID undefined"
+}
+
+// DeviceGroupDevicesNotSupplied indicates that device group devices was not supplied
+type DeviceGroupDevicesNotSupplied struct{}
+
+func (e *DeviceGroupDevicesNotSupplied) Error() string {
+	return "devices must be supplied to be added to or removed from device group"
+}
+
+// DeviceGroupDeviceNotSupplied indicates that device group device was not supplied
+type DeviceGroupDeviceNotSupplied struct{}
+
+func (e *DeviceGroupDeviceNotSupplied) Error() string {
+	return "device-group device must be supplied"
+}
+
+// DeviceGroupAlreadyExists indicates that device group already exists
+type DeviceGroupAlreadyExists struct{}
+
+func (e *DeviceGroupAlreadyExists) Error() string {
+	return "device group already exists"
+}
+
+// DeviceGroupAccountOrNameUndefined indicates that device group account or name are undefined
+type DeviceGroupAccountOrNameUndefined struct{}
+
+func (e *DeviceGroupAccountOrNameUndefined) Error() string {
+	return "device group account or name are undefined"
+}
+
+// DeviceHasImageUndefined indicates that device record has image not defined
+type DeviceHasImageUndefined struct{}
+
+func (e *DeviceHasImageUndefined) Error() string {
+	return "device has image undefined"
+}
+
+// ErrUndefinedCommit indicate that the update transaction/image or some entity  has no commit defined.
+var ErrUndefinedCommit = errors.New("entity has defined commit")

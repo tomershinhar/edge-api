@@ -97,6 +97,27 @@ var _ = Describe("UpdateService Basic functions", func() {
 				WaitForReboot: 0,
 			}
 		})
+		Context("send notification", func() {
+			uuid := faker.UUIDHyphenated()
+			device := models.Device{
+				UUID: uuid,
+			}
+			db.DB.Create(&device)
+			update = models.UpdateTransaction{
+				Devices: []models.Device{
+					device,
+				},
+				Status: models.UpdateStatusBuilding,
+			}
+			db.DB.Create(&update)
+			It("should send the notification", func() {
+				notify, err := updateService.SendDeviceNotification(&update)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(notify.Version).To(Equal("v1.1.0"))
+				Expect(notify.EventType).To(Equal("update-devices"))
+			})
+		})
+
 		Context("from the beginning", func() {
 			uuid := faker.UUIDHyphenated()
 			device := models.Device{
@@ -130,9 +151,16 @@ var _ = Describe("UpdateService Basic functions", func() {
 
 		})
 		Context("when record is found and status is success", func() {
+			uuid := faker.UUIDHyphenated()
+			device := models.Device{
+				UUID: uuid,
+			}
+			db.DB.Create(&device)
+			fmt.Printf("TESTETETETETETETETE :::::: %v\n", device.ID)
 			d := &models.DispatchRecord{
 				PlaybookDispatcherID: faker.UUIDHyphenated(),
 				Status:               models.UpdateStatusBuilding,
+				DeviceID:             device.ID,
 			}
 			db.DB.Create(d)
 			u := &models.UpdateTransaction{
@@ -190,9 +218,15 @@ var _ = Describe("UpdateService Basic functions", func() {
 			Expect(err).To(HaveOccurred())
 		})
 		It("should give error when dispatch record is not found", func() {
+			uuid := faker.UUIDHyphenated()
+			device := models.Device{
+				UUID: uuid,
+			}
+			db.DB.Create(&device)
 			d := &models.DispatchRecord{
 				PlaybookDispatcherID: faker.UUIDHyphenated(),
 				Status:               models.UpdateStatusBuilding,
+				DeviceID:             device.ID,
 			}
 			db.DB.Create(d)
 			event := &services.PlaybookDispatcherEvent{
@@ -219,7 +253,6 @@ var _ = Describe("UpdateService Basic functions", func() {
 				fname := fmt.Sprintf("playbook_dispatcher_update_%s_%d.yml", account, t.UpdateTransactionID)
 				tmpfilepath := fmt.Sprintf("/tmp/%s", fname)
 
-				defer GinkgoRecover()
 				ctrl := gomock.NewController(GinkgoT())
 				defer ctrl.Finish()
 				mockFilesService := mock_services.NewMockFilesService(ctrl)
@@ -320,6 +353,106 @@ var _ = Describe("UpdateService Basic functions", func() {
 				updateService.SetUpdateStatus(u)
 				db.DB.First(&u, u.ID)
 				Expect(u.Status).To(Equal(models.UpdateStatusSuccess))
+			})
+		})
+	})
+
+	Describe("Update Devices From Update Transaction", func() {
+		account := faker.UUIDHyphenated()
+		imageSet := models.ImageSet{Account: account, Name: faker.UUIDHyphenated()}
+		db.DB.Create(&imageSet)
+		currentCommit := models.Commit{Account: account, OSTreeCommit: faker.UUIDHyphenated()}
+		db.DB.Create(&currentCommit)
+		currentImage := models.Image{Account: account, CommitID: currentCommit.ID, ImageSetID: &imageSet.ID, Status: models.ImageStatusSuccess}
+		db.DB.Create(&currentImage)
+
+		newCommit := models.Commit{Account: account, OSTreeCommit: faker.UUIDHyphenated()}
+		db.DB.Create(&newCommit)
+		newImage := models.Image{Account: account, CommitID: newCommit.ID, ImageSetID: &imageSet.ID, Status: models.ImageStatusSuccess}
+		db.DB.Create(&newImage)
+
+		device := models.Device{Account: account, ImageID: currentImage.ID, UpdateAvailable: true}
+		db.DB.Create(&device)
+		update := models.UpdateTransaction{
+			Account:  account,
+			Devices:  []models.Device{device},
+			CommitID: newCommit.ID,
+			Status:   models.UpdateStatusBuilding,
+		}
+		db.DB.Create(&update)
+
+		ctx := context.Background()
+		updateService := services.NewUpdateService(ctx, log.NewEntry(log.StandardLogger()))
+
+		Context("when update status is not success", func() {
+			It("initialisation should pass", func() {
+				err := updateService.UpdateDevicesFromUpdateTransaction(update)
+				Expect(err).To(BeNil())
+			})
+
+			It("should not update device", func() {
+				var currentDevice models.Device
+				result := db.DB.First(&currentDevice, device.ID)
+				Expect(result.Error).To(BeNil())
+
+				Expect(currentDevice.ImageID).To(Equal(currentImage.ID))
+				Expect(currentDevice.UpdateAvailable).To(Equal(true))
+
+			})
+		})
+
+		Context("when update status is success", func() {
+			It("initialisation should pass", func() {
+				update.Status = models.UpdateStatusSuccess
+				result := db.DB.Save(&update)
+				Expect(result.Error).To(BeNil())
+
+				err := updateService.UpdateDevicesFromUpdateTransaction(update)
+				Expect(err).To(BeNil())
+			})
+
+			It("should update device", func() {
+				var currentDevice models.Device
+				result := db.DB.First(&currentDevice, device.ID)
+				Expect(result.Error).To(BeNil())
+
+				Expect(currentDevice.ImageID).To(Equal(newImage.ID))
+				Expect(currentDevice.UpdateAvailable).To(Equal(false))
+			})
+
+			It("should update device image_id to update one and UpdateAvailable to true  ", func() {
+				commit := models.Commit{Account: account, OSTreeCommit: faker.UUIDHyphenated()}
+				result := db.DB.Create(&commit)
+				Expect(result.Error).To(BeNil())
+				image := models.Image{Account: account, CommitID: commit.ID, ImageSetID: &imageSet.ID, Status: models.ImageStatusSuccess}
+				result = db.DB.Create(&image)
+				Expect(result.Error).To(BeNil())
+
+				// create a new image,  without commit as we do not need it for the current function
+				lastImage := models.Image{Account: account, ImageSetID: &imageSet.ID, Status: models.ImageStatusSuccess}
+				result = db.DB.Create(&lastImage)
+				Expect(result.Error).To(BeNil())
+
+				// create a new update with commit and image, knowing that we have a new image
+				update := models.UpdateTransaction{
+					Account:  account,
+					Devices:  []models.Device{device},
+					CommitID: commit.ID,
+					Status:   models.UpdateStatusSuccess,
+				}
+				result = db.DB.Create(&update)
+				Expect(result.Error).To(BeNil())
+
+				err := updateService.UpdateDevicesFromUpdateTransaction(update)
+				Expect(err).To(BeNil())
+				var currentDevice models.Device
+				result = db.DB.First(&currentDevice, device.ID)
+				Expect(result.Error).To(BeNil())
+
+				// should detect the new update commit image
+				Expect(currentDevice.ImageID).To(Equal(image.ID))
+				// should detect that we have newer images
+				Expect(currentDevice.UpdateAvailable).To(Equal(true))
 			})
 		})
 	})

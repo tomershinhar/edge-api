@@ -95,6 +95,21 @@ func (mr *MockUpdateServiceInterfaceMockRecorder) ProcessPlaybookDispatcherRunEv
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ProcessPlaybookDispatcherRunEvent", reflect.TypeOf((*MockUpdateServiceInterface)(nil).ProcessPlaybookDispatcherRunEvent), message)
 }
 
+// SendDeviceNotification mocks base method.
+func (m *MockUpdateServiceInterface) SendDeviceNotification(update *models.UpdateTransaction) (services.ImageNotification, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SendDeviceNotification", update)
+	ret0, _ := ret[0].(services.ImageNotification)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SendDeviceNotification indicates an expected call of SendDeviceNotification.
+func (mr *MockUpdateServiceInterfaceMockRecorder) SendDeviceNotification(update interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SendDeviceNotification", reflect.TypeOf((*MockUpdateServiceInterface)(nil).SendDeviceNotification), update)
+}
+
 // SetUpdateStatus mocks base method.
 func (m *MockUpdateServiceInterface) SetUpdateStatus(update *models.UpdateTransaction) error {
 	m.ctrl.T.Helper()
@@ -121,6 +136,20 @@ func (m *MockUpdateServiceInterface) SetUpdateStatusBasedOnDispatchRecord(dispat
 func (mr *MockUpdateServiceInterfaceMockRecorder) SetUpdateStatusBasedOnDispatchRecord(dispatchRecord interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetUpdateStatusBasedOnDispatchRecord", reflect.TypeOf((*MockUpdateServiceInterface)(nil).SetUpdateStatusBasedOnDispatchRecord), dispatchRecord)
+}
+
+// UpdateDevicesFromUpdateTransaction mocks base method.
+func (m *MockUpdateServiceInterface) UpdateDevicesFromUpdateTransaction(update models.UpdateTransaction) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UpdateDevicesFromUpdateTransaction", update)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// UpdateDevicesFromUpdateTransaction indicates an expected call of UpdateDevicesFromUpdateTransaction.
+func (mr *MockUpdateServiceInterfaceMockRecorder) UpdateDevicesFromUpdateTransaction(update interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateDevicesFromUpdateTransaction", reflect.TypeOf((*MockUpdateServiceInterface)(nil).UpdateDevicesFromUpdateTransaction), update)
 }
 
 // WriteTemplate mocks base method.

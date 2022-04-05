@@ -14,6 +14,7 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/redhatinsights/edge-api/config"
+	"github.com/redhatinsights/edge-api/pkg/errors"
 	"github.com/redhatinsights/edge-api/pkg/models"
 
 	"github.com/redhatinsights/edge-api/pkg/clients/fdo"
@@ -59,7 +60,7 @@ var _ = Describe("Client", func() {
 			} else if numOfOVsInt == 10 {
 				w.WriteHeader(http.StatusCreated)
 				ovData := models.OwnershipVoucherData{
-					ProtocolVersion: 100,
+					ProtocolVersion: 101,
 					GUID:            "12345678-1234-1234-1234-123456789012",
 					DeviceName:      "test-device",
 				}
@@ -92,14 +93,14 @@ var _ = Describe("Client", func() {
 				Expect(j).ToNot(BeNil())
 			})
 			ovsData := [1]models.OwnershipVoucherData{}
-			resJson, _ := json.Marshal(j)
-			err = json.Unmarshal(resJson, &ovsData)
+			resJSON, _ := json.Marshal(j)
+			err = json.Unmarshal(resJSON, &ovsData)
 			It("should successfully unmarshal json", func() {
 				Expect(err).To(BeNil())
 				Expect(ovsData).ToNot(BeNil())
-				Expect(ovsData[0].ProtocolVersion).To(Equal(uint32(100)))
-				Expect(ovsData[0].GUID).To(Equal("214d64be-3227-92da-0333-b1e1fe832f24"))
-				Expect(ovsData[0].DeviceName).To(Equal("testdevice1"))
+				Expect(ovsData[0].ProtocolVersion).To(Equal(uint32(101)))
+				Expect(ovsData[0].GUID).To(Equal("18907279-a41d-049a-ae3c-4da4ce61c14b"))
+				Expect(ovsData[0].DeviceName).To(Equal("testdevice"))
 			})
 		})
 		Context("upload multiple ov", func() {
@@ -116,12 +117,12 @@ var _ = Describe("Client", func() {
 				Expect(j).ToNot(BeNil())
 			})
 			ovsData := [10]models.OwnershipVoucherData{}
-			resJson, _ := json.Marshal(j)
-			err = json.Unmarshal(resJson, &ovsData)
+			resJSON, _ := json.Marshal(j)
+			err = json.Unmarshal(resJSON, &ovsData)
 			It("should successfully unmarshal json", func() {
 				Expect(err).To(BeNil())
 				Expect(ovsData).ToNot(BeNil())
-				Expect(ovsData[0].ProtocolVersion).To(Equal(uint32(100)))
+				Expect(ovsData[0].ProtocolVersion).To(Equal(uint32(101)))
 				Expect(ovsData[0].GUID).To(Equal("12345678-1234-1234-1234-123456789012"))
 				Expect(ovsData[0].DeviceName).To(Equal("test-device"))
 			})
@@ -176,6 +177,81 @@ var _ = Describe("Client", func() {
 				Expect(j).ToNot(BeNil())
 				Expect(j.(map[string]interface{})["op"]).To(Equal("delete"))
 				Expect(j.(map[string]interface{})["status"]).To(Equal("OK"))
+			})
+		})
+	})
+
+	Describe("API errors handling", func() {
+		client := fdo.InitClient(ctx, log.NewEntry(testLogger))
+		ov, _ := ioutil.ReadFile("/testdevice1.ov")
+		Context("upload ov - bad request", func() {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errors.NewBadRequest("bad request"))
+			}))
+			defer ts.Close()
+			config.Get().FDO.URL = ts.URL
+			_, err := client.BatchUpload(ov, 1)
+			It("should fail upload ov", func() {
+				Expect(err).ToNot(BeNil())
+				Expect(err.Error()).To(ContainSubstring("bad request"))
+			})
+		})
+		Context("delete ov - bad request", func() {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(errors.NewBadRequest("bad request"))
+			}))
+			defer ts.Close()
+			config.Get().FDO.URL = ts.URL
+			_, err := client.BatchDelete([]string{"a9bcd683-a7e4-46ed-80b2-6e55e8610d04", "1ea69fcb-b784-4d0f-ab4d-94589c6cc7ad"})
+			It("should fail delete ov", func() {
+				Expect(err).ToNot(BeNil())
+				Expect(err.Error()).To(ContainSubstring("bad request"))
+			})
+		})
+		Context("upload ov - internal server error", func() {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(errors.NewInternalServerError())
+			}))
+			defer ts.Close()
+			config.Get().FDO.URL = ts.URL
+			_, err := client.BatchUpload(ov, 1)
+			It("should fail upload ov", func() {
+				Expect(err).ToNot(BeNil())
+				Expect(err.Error()).To(Equal("unknown error with status code: " + strconv.Itoa(http.StatusInternalServerError)))
+			})
+		})
+		Context("delete ov - internal server error", func() {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(errors.NewInternalServerError())
+			}))
+			defer ts.Close()
+			config.Get().FDO.URL = ts.URL
+			_, err := client.BatchDelete([]string{"a9bcd683-a7e4-46ed-80b2-6e55e8610d04", "1ea69fcb-b784-4d0f-ab4d-94589c6cc7ad"})
+			It("should fail delete ov", func() {
+				Expect(err).ToNot(BeNil())
+				Expect(err.Error()).To(Equal("unknown error with status code: " + strconv.Itoa(http.StatusInternalServerError)))
+			})
+		})
+		Context("upload ov - no FDO server available", func() {
+			_, err := client.BatchUpload(ov, 1)
+			It("should fail upload ov", func() {
+				Expect(err).ToNot(BeNil())
+				Expect(err.Error()).To(ContainSubstring("connection refused"))
+			})
+		})
+		Context("delete ov - no FDO server available", func() {
+			_, err := client.BatchDelete([]string{"a9bcd683-a7e4-46ed-80b2-6e55e8610d04", "1ea69fcb-b784-4d0f-ab4d-94589c6cc7ad"})
+			It("should fail delete ov", func() {
+				Expect(err).ToNot(BeNil())
+				Expect(err.Error()).To(ContainSubstring("connection refused"))
 			})
 		})
 	})

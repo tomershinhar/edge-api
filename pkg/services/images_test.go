@@ -11,6 +11,7 @@ import (
 	"github.com/redhatinsights/edge-api/pkg/clients/imagebuilder/mock_imagebuilder"
 	"github.com/redhatinsights/edge-api/pkg/db"
 	"github.com/redhatinsights/edge-api/pkg/models"
+	"github.com/redhatinsights/edge-api/pkg/routes/common"
 	"github.com/redhatinsights/edge-api/pkg/services"
 	"github.com/redhatinsights/edge-api/pkg/services/mock_services"
 	log "github.com/sirupsen/logrus"
@@ -33,39 +34,129 @@ var _ = Describe("Image Service Test", func() {
 		}
 	})
 	Describe("get image", func() {
-		Context("by id when image is not found", func() {
-			var image *models.Image
-			var err error
-			BeforeEach(func() {
-				id, _ := faker.RandomInt(1)
-				image, err = service.GetImageByID(fmt.Sprint(id[0]))
+		When("image is not found", func() {
+			Context("by id", func() {
+				var image *models.Image
+				var err error
+				BeforeEach(func() {
+					id, _ := faker.RandomInt(1)
+					image, err = service.GetImageByID(fmt.Sprint(id[0]))
+				})
+				It("should have an error", func() {
+					Expect(err).To(HaveOccurred())
+					Expect(err).To(MatchError(new(services.ImageNotFoundError)))
+				})
+				It("should have a empty image", func() {
+					Expect(image).To(BeNil())
+				})
 			})
-			It("should have an error", func() {
-				Expect(err).To(HaveOccurred())
-				Expect(err).To(MatchError(new(services.ImageNotFoundError)))
-			})
-			It("should have a empty image", func() {
-				Expect(image).To(BeNil())
+			Context("by hash", func() {
+				var image *models.Image
+				var err error
+				BeforeEach(func() {
+					hash = faker.Word()
+					image, err = service.GetImageByOSTreeCommitHash(hash)
+				})
+				It("should have an error", func() {
+					Expect(err).To(HaveOccurred())
+					Expect(err).To(MatchError(new(services.ImageNotFoundError)))
+				})
+				It("should have a empty image", func() {
+					Expect(image).To(BeNil())
+				})
 			})
 		})
+		When("image exists", func() {
+			var imageV1, imageV2 *models.Image
+			var imageSet *models.ImageSet
 
-		Context("by hash when image is not found", func() {
-			var image *models.Image
-			var err error
 			BeforeEach(func() {
-				hash = faker.Word()
-				image, err = service.GetImageByOSTreeCommitHash(hash)
+				imageSet = &models.ImageSet{
+					Name:    "test",
+					Version: 2,
+					Account: common.DefaultAccount,
+				}
+				result := db.DB.Create(imageSet)
+				Expect(result.Error).ToNot(HaveOccurred())
+				imageV1 = &models.Image{
+					Commit: &models.Commit{
+						OSTreeCommit: faker.UUIDHyphenated(),
+					},
+					Status:     models.ImageStatusSuccess,
+					ImageSetID: &imageSet.ID,
+					Version:    1,
+					Account:    common.DefaultAccount,
+				}
+				result = db.DB.Create(imageV1.Commit)
+				Expect(result.Error).ToNot(HaveOccurred())
+				result = db.DB.Create(imageV1)
+				Expect(result.Error).ToNot(HaveOccurred())
+				imageV2 = &models.Image{
+					Commit: &models.Commit{
+						OSTreeCommit: faker.UUIDHyphenated(),
+					},
+					Status:     models.ImageStatusSuccess,
+					ImageSetID: &imageSet.ID,
+					Version:    2,
+					Account:    common.DefaultAccount,
+				}
+				db.DB.Create(imageV2.Commit)
+				db.DB.Create(imageV2)
 			})
-
-			It("should have an error", func() {
-				Expect(err).To(HaveOccurred())
-				Expect(err).To(MatchError(new(services.ImageNotFoundError)))
+			Context("by ID", func() {
+				var image *models.Image
+				var err error
+				BeforeEach(func() {
+					image, err = service.GetImageByID(fmt.Sprint(imageV1.ID))
+				})
+				It("should not have an error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should have a v1 image", func() {
+					Expect(image.ID).To(Equal(imageV1.ID))
+				})
 			})
-			It("should have a empty image", func() {
-				Expect(image).To(BeNil())
+			Context("by hash", func() {
+				var image *models.Image
+				var err error
+				BeforeEach(func() {
+					image, err = service.GetImageByOSTreeCommitHash(imageV1.Commit.OSTreeCommit)
+				})
+				It("should not have an error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should have a v1 image", func() {
+					Expect(image.ID).To(Equal(imageV1.ID))
+				})
+			})
+			Context("when rollback image exists", func() {
+				var image *models.Image
+				var err error
+				BeforeEach(func() {
+					image, err = service.GetRollbackImage(imageV2)
+				})
+				It("should have an error", func() {
+					Expect(err).ToNot(HaveOccurred())
+				})
+				It("should have a v1 image", func() {
+					Expect(image.ID).To(Equal(imageV1.ID))
+				})
+			})
+			Context("when rollback image doesnt exists", func() {
+				var image *models.Image
+				var err error
+				BeforeEach(func() {
+					image, err = service.GetRollbackImage(imageV1)
+				})
+				It("should have an error", func() {
+					Expect(err).To(HaveOccurred())
+					Expect(err).To(MatchError(new(services.ImageNotFoundError)))
+				})
+				It("should have a empty image", func() {
+					Expect(image).To(BeNil())
+				})
 			})
 		})
-
 	})
 	Describe("update image", func() {
 		Context("when previous image doesnt exist", func() {
@@ -293,6 +384,149 @@ var _ = Describe("Image Service Test", func() {
 
 				Expect(err).To(HaveOccurred())
 				Expect(err).To(MatchError(new(services.ImageVersionAlreadyExists)))
+			})
+		})
+	})
+	Describe("validate images packages account", func() {
+		Context("when creating an image using third party repository", func() {
+			It("should validate the images packages from account", func() {
+				var repos []models.ThirdPartyRepo
+				account := "00000"
+				err := services.ValidateAllImageReposAreFromAccount(account, repos)
+				Expect(err).ToNot(HaveOccurred())
+
+			})
+			It("should give an error", func() {
+				var repos []models.ThirdPartyRepo
+				account := ""
+				err := services.ValidateAllImageReposAreFromAccount(account, repos)
+				Expect(err).To(HaveOccurred())
+				Expect(err).To(MatchError("repository information is not valid"))
+			})
+		})
+	})
+
+	Describe("send image starts notification", func() {
+		Context("when creating an image we should send a notification to topic", func() {
+			It("validate content", func() {
+				var image *models.Image
+				var err error
+				imageSet := &models.ImageSet{
+					Name:    "test",
+					Version: 1,
+					Account: common.DefaultAccount,
+				}
+				db.DB.Create(imageSet)
+
+				image = &models.Image{
+					Commit: &models.Commit{
+						OSTreeCommit: faker.UUIDHyphenated(),
+					},
+					Status:     models.ImageStatusSuccess,
+					ImageSetID: &imageSet.ID,
+					Version:    1,
+					Account:    common.DefaultAccount,
+				}
+				db.DB.Create(image)
+				image, err = service.GetImageByID(fmt.Sprint(image.ID))
+				Expect(err).ToNot(HaveOccurred())
+
+				notify, err := service.SendImageNotification(image)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(notify.Version).To(Equal("v1.1.0"))
+				Expect(notify.EventType).To(Equal("image-creation"))
+
+			})
+
+		})
+	})
+	Describe("Devices update availability from image set", func() {
+		Context("should set device update availability", func() {
+			account := faker.UUIDHyphenated()
+			imageSet := models.ImageSet{Account: account, Name: faker.UUIDHyphenated()}
+			db.DB.Create(&imageSet)
+			initialImages := []models.Image{
+				{Status: models.ImageStatusSuccess, ImageSetID: &imageSet.ID, Account: account},
+				{Status: models.ImageStatusSuccess, ImageSetID: &imageSet.ID, Account: account},
+				{Status: models.ImageStatusSuccess, ImageSetID: &imageSet.ID, Account: account},
+				{Status: models.ImageStatusSuccess, ImageSetID: &imageSet.ID, Account: account},
+			}
+			images := make([]models.Image, 0, len(initialImages))
+			for _, image := range initialImages {
+				db.DB.Create(&image)
+				images = append(images, image)
+				fmt.Println("IMG >>>>", image.ID)
+			}
+
+			devices := make([]models.Device, 0, len(images))
+			for ind, image := range images {
+				device := models.Device{Account: account, ImageID: image.ID, UpdateAvailable: false}
+				if ind == len(images)-1 {
+					device.UpdateAvailable = true
+				}
+				db.DB.Create(&device)
+				devices = append(devices, device)
+			}
+			lastDevicesIndex := len(devices) - 1
+
+			OtherImageSet := models.ImageSet{Account: account, Name: faker.UUIDHyphenated()}
+			db.DB.Create(&OtherImageSet)
+
+			otherImage := models.Image{Status: models.ImageStatusSuccess, ImageSetID: &OtherImageSet.ID, Account: account}
+			db.DB.Create(&otherImage)
+			OtherDevice := models.Device{Account: account, ImageID: otherImage.ID, UpdateAvailable: true}
+			db.DB.Create(&OtherDevice)
+
+			It("No error occurred without errors when calling function", func() {
+				err := service.SetDevicesUpdateAvailabilityFromImageSet(account, imageSet.ID)
+				Expect(err).To(BeNil())
+			})
+
+			It("All devices has UpdateAvailable updated as expected", func() {
+				// reload devices fro db
+				savedDevices := make([]models.Device, 0, len(devices))
+				for _, device := range devices {
+					var savedDevice models.Device
+					db.DB.First(&savedDevice, device.ID)
+					savedDevices = append(savedDevices, savedDevice)
+				}
+				for ind, device := range savedDevices {
+					if ind == lastDevicesIndex {
+						Expect(device.UpdateAvailable).To(Equal(false))
+					} else {
+						Expect(device.UpdateAvailable).To(Equal(true))
+					}
+				}
+			})
+
+			It("Other device not updated as having an other imageSet", func() {
+				// reload other device
+				var device models.Device
+				result := db.DB.First(&device, OtherDevice.ID)
+				Expect(result.Error).To(BeNil())
+				Expect(OtherDevice.UpdateAvailable).To(Equal(true))
+			})
+
+			It("running function for Other imageSet update other device", func() {
+				err := service.SetDevicesUpdateAvailabilityFromImageSet(account, OtherImageSet.ID)
+				Expect(err).To(BeNil())
+				// reload other device
+				var device models.Device
+				result := db.DB.First(&device, OtherDevice.ID)
+				Expect(result.Error).To(BeNil())
+				Expect(device.UpdateAvailable).To(Equal(false))
+			})
+
+			It("should run without errors when no devices", func() {
+				imageSet := models.ImageSet{Account: account, Name: faker.UUIDHyphenated()}
+				result := db.DB.Create(&imageSet)
+				Expect(result.Error).To(BeNil())
+				image := models.Image{Status: models.ImageStatusSuccess, ImageSetID: &imageSet.ID, Account: account}
+				result = db.DB.Create(&image)
+				Expect(result.Error).To(BeNil())
+
+				err := service.SetDevicesUpdateAvailabilityFromImageSet(account, imageSet.ID)
+				Expect(err).To(BeNil())
 			})
 		})
 	})

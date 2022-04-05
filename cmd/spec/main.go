@@ -25,13 +25,12 @@ func (s *edgeAPISchemaGen) init() {
 
 func (s *edgeAPISchemaGen) addSchema(name string, model interface{}) {
 	schema, err := openapi3gen.NewSchemaRefForValue(model, s.Components.Schemas)
-	if err != nil {
-		panic(err)
-	}
+	checkErr(err)
 	s.Components.Schemas[name] = schema
 }
 
 // Used to generate openapi yaml file for components.
+// Typically, runs either locally or as part of GitHub Actions (.github/workflows/lint.yml)
 func main() {
 	gen := edgeAPISchemaGen{}
 	gen.init()
@@ -55,6 +54,9 @@ func main() {
 	gen.addSchema("v1.BadRequest", &errors.BadRequest{})
 	gen.addSchema("v1.NotFound", &errors.NotFound{})
 	gen.addSchema("v1.ThirdPartyRepo", &models.ThirdPartyRepo{})
+	gen.addSchema("v1.DeviceDetailsList", &models.DeviceDetailsList{})
+	gen.addSchema("v1.DeviceGroup", &models.DeviceGroup{})
+	gen.addSchema("v1.DeviceGroupDetails", &models.DeviceGroupDetails{})
 
 	type Swagger struct {
 		Components openapi3.Components `json:"components,omitempty" yaml:"components,omitempty"`
@@ -82,15 +84,16 @@ func main() {
 
 	jsonB, err := json.MarshalIndent(doc, "", "  ")
 	checkErr(err)
-	err = ioutil.WriteFile("./cmd/spec/openapi.json", jsonB, 0666)
+	err = ioutil.WriteFile("./cmd/spec/openapi.json", jsonB, 0644) // #nosec G306
 	checkErr(err)
-	err = ioutil.WriteFile("./cmd/spec/openapi.yaml", b.Bytes(), 0666)
+	err = ioutil.WriteFile("./cmd/spec/openapi.yaml", b.Bytes(), 0644) // #nosec G306
 	checkErr(err)
 	fmt.Println("Spec was generated successfully")
 }
 
 func checkErr(err error) {
 	if err != nil {
+		// This will not cause the pod to crash so don't call LogErrorAndPanic()
 		panic(err)
 	}
 }

@@ -14,11 +14,13 @@ import (
 	"text/template"
 	"time"
 
+	clowder "github.com/redhatinsights/app-common-go/pkg/api/v1"
 	"github.com/redhatinsights/edge-api/config"
 	"github.com/redhatinsights/edge-api/pkg/clients/playbookdispatcher"
 	"github.com/redhatinsights/edge-api/pkg/db"
 	"github.com/redhatinsights/edge-api/pkg/models"
 	log "github.com/sirupsen/logrus"
+	"gopkg.in/confluentinc/confluent-kafka-go.v1/kafka"
 )
 
 // UpdateServiceInterface defines the interface that helps
@@ -31,6 +33,8 @@ type UpdateServiceInterface interface {
 	WriteTemplate(templateInfo TemplateRemoteInfo, account string) (string, error)
 	SetUpdateStatusBasedOnDispatchRecord(dispatchRecord models.DispatchRecord) error
 	SetUpdateStatus(update *models.UpdateTransaction) error
+	SendDeviceNotification(update *models.UpdateTransaction) (ImageNotification, error)
+	UpdateDevicesFromUpdateTransaction(update models.UpdateTransaction) error
 }
 
 // NewUpdateService gives a instance of the main implementation of a UpdateServiceInterface
@@ -107,7 +111,7 @@ func (s *UpdateService) CreateUpdate(id uint) (*models.UpdateTransaction, error)
 		WaitGroup.Done() // Done with one update (successfully or not)
 		s.log.Debug("Done with one update - successfully or not")
 		if err := recover(); err != nil {
-			s.log.WithField("error", err).Fatal("Error on update")
+			s.log.WithField("error", err).Error("Error on update")
 		}
 	}()
 	go func(update *models.UpdateTransaction) {
@@ -124,7 +128,7 @@ func (s *UpdateService) CreateUpdate(id uint) (*models.UpdateTransaction, error)
 			update.Status = models.UpdateStatusError
 			tx := db.DB.Save(update)
 			if tx.Error != nil {
-				s.log.WithField("error", tx.Error.Error()).Fatal("Error saving update")
+				s.log.WithField("error", tx.Error.Error()).Error("Error saving update")
 			}
 			WaitGroup.Done()
 		}
@@ -155,6 +159,7 @@ func (s *UpdateService) CreateUpdate(id uint) (*models.UpdateTransaction, error)
 	// 3. Loop through all devices in UpdateTransaction
 	dispatchRecords := update.DispatchRecords
 	for _, device := range update.Devices {
+		device := device // this will prevent implicit memory aliasing in the loop
 		// Create new &DispatcherPayload{}
 		payloadDispatcher := playbookdispatcher.DispatcherPayload{
 			Recipient:   device.RHCClientID,
@@ -322,7 +327,7 @@ func (s *UpdateService) ProcessPlaybookDispatcherRunEvent(message []byte) error 
 	}
 
 	var dispatchRecord models.DispatchRecord
-	result := db.DB.Where(&models.DispatchRecord{PlaybookDispatcherID: e.Payload.ID}).First(&dispatchRecord)
+	result := db.DB.Where(&models.DispatchRecord{PlaybookDispatcherID: e.Payload.ID}).Preload("Device").First(&dispatchRecord)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -330,13 +335,16 @@ func (s *UpdateService) ProcessPlaybookDispatcherRunEvent(message []byte) error 
 	if e.Payload.Status == PlaybookStatusFailure || e.Payload.Status == PlaybookStatusTimeout {
 		dispatchRecord.Status = models.DispatchRecordStatusError
 	} else if e.Payload.Status == PlaybookStatusSuccess {
+		fmt.Printf("$$$$$$$$$ dispatchRecord.Device %v\n", dispatchRecord.Device)
 		// TODO: We might wanna check if it's really success by checking the running hash on the device here
 		dispatchRecord.Status = models.DispatchRecordStatusComplete
+		dispatchRecord.Device.AvailableHash = os.DevNull
+		dispatchRecord.Device.CurrentHash = dispatchRecord.Device.AvailableHash
 	} else if e.Payload.Status == PlaybookStatusRunning {
 		dispatchRecord.Status = models.DispatchRecordStatusRunning
 	} else {
 		dispatchRecord.Status = models.DispatchRecordStatusError
-		s.log.Fatal("Playbook status is not on the json schema for this event")
+		s.log.Error("Playbook status is not on the json schema for this event")
 	}
 	result = db.DB.Save(&dispatchRecord)
 	if result.Error != nil {
@@ -360,8 +368,11 @@ func (s *UpdateService) SetUpdateStatusBasedOnDispatchRecord(dispatchRecord mode
 		return result.Error
 	}
 
-	return s.SetUpdateStatus(&update)
+	if err := s.SetUpdateStatus(&update); err != nil {
+		return err
+	}
 
+	return s.UpdateDevicesFromUpdateTransaction(update)
 }
 
 // SetUpdateStatus is the function to set the update status from an UpdateTransaction
@@ -383,4 +394,142 @@ func (s *UpdateService) SetUpdateStatus(update *models.UpdateTransaction) error 
 	// If there isn't an error and it's not all success, some updates are still happening
 	result := db.DB.Save(update)
 	return result.Error
+}
+
+// SendDeviceNotification connects to platform.notifications.ingress on image topic
+func (s *UpdateService) SendDeviceNotification(i *models.UpdateTransaction) (ImageNotification, error) {
+	s.log.WithField("message", i).Info("SendImageNotification::Starts")
+	var notify ImageNotification
+	notify.Version = NotificationConfigVersion
+	notify.Bundle = NotificationConfigBundle
+	notify.Application = NotificationConfigApplication
+	notify.EventType = NotificationConfigEventTypeDevice
+	notify.Timestamp = time.Now().Format(time.RFC3339)
+
+	if clowder.IsClowderEnabled() {
+		var users []string
+		var events []EventNotification
+		var event EventNotification
+		var recipients []RecipientNotification
+		var recipient RecipientNotification
+		brokers := make([]string, len(clowder.LoadedConfig.Kafka.Brokers))
+
+		for i, b := range clowder.LoadedConfig.Kafka.Brokers {
+			brokers[i] = fmt.Sprintf("%s:%d", b.Hostname, *b.Port)
+			fmt.Println(brokers[i])
+		}
+
+		topic := NotificationTopic
+
+		// Create Producer instance
+		p, err := kafka.NewProducer(&kafka.ConfigMap{
+			"bootstrap.servers": brokers[0]})
+		if err != nil {
+			s.log.WithField("message", err.Error()).Error("producer")
+			os.Exit(1)
+		}
+
+		type metadata struct {
+			metaMap map[string]string
+		}
+		emptyJSON := metadata{
+			metaMap: make(map[string]string),
+		}
+
+		event.Metadata = emptyJSON.metaMap
+
+		event.Payload = fmt.Sprintf("{  \"UpdateID\" : \"%v\"}", i.ID)
+		events = append(events, event)
+
+		recipient.IgnoreUserPreferences = false
+		recipient.OnlyAdmins = false
+		users = append(users, NotificationConfigUser)
+		recipient.Users = users
+		recipients = append(recipients, recipient)
+
+		notify.Account = i.Account
+		notify.Context = fmt.Sprintf("{  \"CommitID\" : \"%v\"}", i.CommitID)
+		notify.Events = events
+		notify.Recipients = recipients
+
+		// assemble the message to be sent
+		recordKey := "ImageCreationStarts"
+		recordValue, _ := json.Marshal(notify)
+
+		s.log.WithField("message", recordValue).Info("Preparing record for producer")
+
+		// send the message
+		perr := p.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+			Key:            []byte(recordKey),
+			Value:          []byte(recordValue),
+		}, nil)
+
+		if perr != nil {
+			s.log.WithField("message", perr.Error()).Error("Error on produce")
+			return notify, err
+		}
+		p.Close()
+		s.log.WithField("message", topic).Info("SendNotification message was produced to topic")
+		fmt.Printf("SendNotification message was produced to topic %s!\n", topic)
+		return notify, nil
+	}
+	return notify, nil
+}
+
+// UpdateDevicesFromUpdateTransaction update device with new image and update availability
+func (s *UpdateService) UpdateDevicesFromUpdateTransaction(update models.UpdateTransaction) error {
+	logger := s.log.WithFields(log.Fields{"account": update.Account, "context": "UpdateDevicesFromUpdateTransaction"})
+	if update.Status != models.UpdateStatusSuccess {
+		// update only when update is successful
+		// do nothing
+		logger.Debug("ignore device update when update is not successful")
+		return nil
+	}
+
+	// reload update transaction from db
+	var currentUpdate models.UpdateTransaction
+	if result := db.DB.Where("account = ?", update.Account).Preload("Devices").Preload("Commit").First(&currentUpdate, update.ID); result.Error != nil {
+		return result.Error
+	}
+
+	if currentUpdate.Commit == nil {
+		logger.Error("The update transaction has no commit defined")
+		return ErrUndefinedCommit
+	}
+
+	// get the update commit image
+	var deviceImage models.Image
+	if result := db.DB.Joins("JOIN commits ON commits.id = images.commit_id").
+		Where("images.account = ? AND commits.os_tree_commit = ? ", currentUpdate.Account, currentUpdate.Commit.OSTreeCommit).
+		First(&deviceImage); result.Error != nil {
+		logger.WithField("error", result.Error).Error("Error while getting device image")
+		return result.Error
+	}
+
+	// get image update availability, by finding if there is later images updates
+	// consider only those with ImageStatusSuccess
+	var updateImages []models.Image
+	if result := db.DB.Select("id").Where("account = ? AND image_set_id = ? AND status = ? AND created_at > ?",
+		deviceImage.Account, deviceImage.ImageSetID, models.ImageStatusSuccess, deviceImage.CreatedAt).Find(&updateImages); result.Error != nil {
+		logger.WithField("error", result.Error).Error("Error while getting update images")
+		return result.Error
+	}
+	updateAvailable := len(updateImages) > 0
+
+	// create a slice of devices ids
+	devicesIDS := make([]uint, 0, len(currentUpdate.Devices))
+	for _, device := range currentUpdate.Devices {
+		devicesIDS = append(devicesIDS, device.ID)
+	}
+
+	// update devices with image and update availability
+	if result := db.DB.Model(&models.Device{}).
+		Where("account = ? AND id IN (?) ", deviceImage.Account, devicesIDS).
+		Updates(map[string]interface{}{"image_id": deviceImage.ID, "update_available": updateAvailable}); result.Error != nil {
+		logger.WithField("error", result.Error).Error("Error occurred while updating device image and update_available")
+		return result.Error
+	}
+
+	return nil
 }

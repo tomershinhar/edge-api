@@ -1,6 +1,6 @@
 # Edge API
 
-[![Go](https://github.com/RedHatInsights/edge-api/actions/workflows/coverage_testing.yml/badge.svg)](https://github.com/RedHatInsights/edge-api/actions/workflows/coverage_testing.yml)
+[![Build Status](https://app.travis-ci.com/RedHatInsights/edge-api.svg?branch=main)](https://app.travis-ci.com/RedHatInsights/edge-api)
 [![codecov](https://codecov.io/gh/RedHatInsights/edge-api/branch/main/graph/badge.svg?token=1CEO1MRGUB)](https://codecov.io/gh/RedHatInsights/edge-api)
 
 ## Overview
@@ -357,13 +357,15 @@ Golang also provides a unit test infrastructure `test`. Run unit tests with the 
 make test
 ```
 
+If you encounter issues, please follow steps under [Setup Podman to run FDO](https://github.com/RedHatInsights/edge-api#setup-podman-to-run-fdo) to setup your system, then [Testing locally with libfdo-data](https://github.com/RedHatInsights/edge-api#testing-locally-with-libfdo-data) to run tests within a speciialized container.
+
 ### API docs
 
 [kin-openapi](https://github.com/getkin/kin-openapi) is a tool that helps us handle docs in the format of [Open API spec](https://github.com/OAI/OpenAPI-Specification). Sadly, it does not generate docs *automagically*. We have a [script](cmd/spec/main.go) that generates the docs and you have to add your model there to be picked by the code generation.
 
 The [openapi3gen](https://github.com/getkin/kin-openapi/tree/v0.65.0/openapi3gen) package generates the docs for the models in the project and we have to update the routes by hand on the [path.yml](cmd/spec/path.yaml) file. Our generation [script](cmd/spec/main.go) adds the routes that you wrote by hand, creating an openapi.json and a openapi.yaml.
 
-You have to commit and create a pull-request to update the docs as this process is not automated as of now.
+You have to commit and create a pull-request to update the docs.
 
 To run the comand that generates the docs, you can use:
 

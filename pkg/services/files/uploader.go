@@ -3,6 +3,7 @@ package files
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/redhatinsights/edge-api/config"
+	"github.com/redhatinsights/edge-api/logger"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -25,10 +27,11 @@ type Uploader interface {
 func NewUploader(log *log.Entry) Uploader {
 	cfg := config.Get()
 	var uploader Uploader
-	uploader = &FileUploader{
-		BaseDir: "./",
+	uploader = &LocalUploader{
+		BaseDir: "/tmp",
+		log:     log,
 	}
-	if cfg.BucketName != "" {
+	if !cfg.Local {
 		uploader = newS3Uploader(log)
 	}
 	return uploader
@@ -42,23 +45,36 @@ type S3Uploader struct {
 	log               *log.Entry
 }
 
-// FileUploader isn't actually an uploader but implements the interface in
+// LocalUploader isn't actually an uploader but implements the interface in
 // order to allow the workflow to be done to completion on a local machine
 // without S3
-type FileUploader struct {
+type LocalUploader struct {
 	BaseDir string
+	log     *log.Entry
 }
 
-// UploadRepo is Basically a dummy function that returns the src, but allows offline
-// development without S3 and satisfies the interface
-func (u *FileUploader) UploadRepo(src string, account string) (string, error) {
-	return src, nil
+// UploadRepo just returns the src repo folder
+// It doesnt do anything and it doesn't delete the original folder
+// It returns error if the repo is not using u.BaseDir as its base folder
+// Allowing offline development without S3 and satisfying the interface
+func (u *LocalUploader) UploadRepo(src string, account string) (string, error) {
+	if strings.HasPrefix(src, u.BaseDir) {
+		return src, nil
+	}
+	return "", fmt.Errorf("invalid folder to upload on local uploader")
 }
 
-// UploadFile is Basically a dummy function that returns no error but allows offline
-// development without S3 and satisfies the interface
-func (u *FileUploader) UploadFile(fname string, uploadPath string) (string, error) {
-	return fname, nil
+// UploadFile basically copies a file to the local server path
+// Allowing offline development without S3 and satisfying the interface
+func (u *LocalUploader) UploadFile(fname string, uploadPath string) (string, error) {
+	destfile := filepath.Clean(u.BaseDir + "/" + uploadPath)
+	u.log.WithFields(log.Fields{"fname": fname, "destfine": destfile}).Debug("Copying fname to destfile")
+	cmd := exec.Command("cp", fname, destfile) //#nosec G204 - This uploadPath variable is actually controlled by the calling method
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+	return destfile, nil
 }
 
 func newS3Uploader(log *log.Entry) *S3Uploader {
@@ -76,7 +92,7 @@ func newS3Uploader(log *log.Entry) *S3Uploader {
 			Credentials: credentials.NewStaticCredentials(cfg.AccessKey, cfg.SecretKey, ""),
 		})
 		if err != nil {
-			panic(err)
+			logger.LogErrorAndPanic("Fatal error creating HTTP session", err)
 		}
 	}
 	client := s3.New(sess)
@@ -124,7 +140,7 @@ func (u *S3Uploader) UploadRepo(src string, account string) (string, error) {
 
 	var uploadDetailsList []*uploadDetails
 
-	filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			u.log.WithField("error", err.Error()).Error("Error opening file")
 		}
@@ -141,7 +157,10 @@ func (u *S3Uploader) UploadRepo(src string, account string) (string, error) {
 		uploadDetailsList = append(uploadDetailsList, res)
 		count++
 		return nil
-	})
+	}); err != nil {
+		u.log.WithField("error", err.Error()).Error("Error walking directory")
+		return "", err
+	}
 
 	log.WithField("fileCount", len(uploadDetailsList)).Debug("Files are being uploaded....")
 
@@ -171,28 +190,27 @@ func (u *S3Uploader) UploadRepo(src string, account string) (string, error) {
 // UploadFile takes a Filename path as a string and then uploads that to
 // the supplied location in s3
 func (u *S3Uploader) UploadFile(fname string, uploadPath string) (string, error) {
-	u.log = u.log.WithFields(log.Fields{"fname": fname, "uploadPath": uploadPath})
-	u.log.Info("Uploading file")
-	f, err := os.Open(fname)
+	f, err := os.Open(filepath.Clean(fname))
 	if err != nil {
 		return "", fmt.Errorf("failed to open file %q, %v", fname, err)
 	}
 	// Upload the file to S3.
-	result, err := u.Client.PutObject(&s3.PutObjectInput{
+	_, err = u.Client.PutObject(&s3.PutObjectInput{
 		Bucket: aws.String(u.Bucket),
 		Key:    aws.String(uploadPath),
 		Body:   f,
 		ACL:    aws.String("public-read"),
 	})
 
-	u.log.WithField("result", result).Info("Finished upload to AWS S3")
 	if err != nil {
 		u.log.WithField("error", err.Error()).Error("Error uploading to AWS S3")
 		return "", err
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		u.log.WithField("error", err.Error()).Error("Error closing file")
+		return "", err
+	}
 	region := *u.Client.Config.Region
 	s3URL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", u.Bucket, region, uploadPath)
-	u.log.WithField("s3URL", s3URL).Info("Upload file finished...")
 	return s3URL, nil
 }

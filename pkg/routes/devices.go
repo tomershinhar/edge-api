@@ -2,31 +2,36 @@ package routes
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
+	"net/url"
 
 	"github.com/go-chi/chi"
+	"github.com/redhatinsights/edge-api/pkg/clients/inventory"
+	"github.com/redhatinsights/edge-api/pkg/db"
 	"github.com/redhatinsights/edge-api/pkg/dependencies"
 	"github.com/redhatinsights/edge-api/pkg/errors"
+	"github.com/redhatinsights/edge-api/pkg/models"
+	"github.com/redhatinsights/edge-api/pkg/routes/common"
 	"github.com/redhatinsights/edge-api/pkg/services"
-	log "github.com/sirupsen/logrus"
 )
 
 // MakeDevicesRouter adds support for operations on update
 func MakeDevicesRouter(sub chi.Router) {
-	sub.Get("/", GetInventory) // TODO: Still a proof-of-concept and needs to be refactored in the future
+	sub.Get("/", GetDevices)
+	sub.With(common.Paginate).Get("/db", GetDBDevices)
 	sub.Route("/{DeviceUUID}", func(r chi.Router) {
 		r.Use(DeviceCtx)
+		r.Get("/dbinfo", GetDeviceDBInfo)
 		r.Get("/", GetDevice)
 		r.Get("/updates", GetUpdateAvailableForDevice)
 		r.Get("/image", GetDeviceImageInfo)
 	})
 }
 
-type deviceContextKey int
+type deviceContextKeyType string
 
-// DeviceContextKey is the key to DeviceContext (for Device requests)
-const DeviceContextKey deviceContextKey = iota
+// deviceContextKey is the key to DeviceContext (for Device requests)
+const deviceContextKey = deviceContextKeyType("device_context_key")
 
 // DeviceContext implements context interfaces so we can shuttle around multiple values
 type DeviceContext struct {
@@ -41,77 +46,61 @@ func DeviceCtx(next http.Handler) http.Handler {
 		var dc DeviceContext
 		dc.DeviceUUID = chi.URLParam(r, "DeviceUUID")
 		if dc.DeviceUUID == "" {
-			err := errors.NewBadRequest("DeviceUUID must be sent")
-			w.WriteHeader(err.GetStatus())
-			json.NewEncoder(w).Encode(&err)
+			contextServices := dependencies.ServicesFromContext(r.Context())
+			respondWithAPIError(w, contextServices.Log, errors.NewBadRequest("DeviceUUID must be sent"))
 			return
 		}
 		// TODO: Implement devices by tag
 		// dc.Tag = chi.URLParam(r, "Tag")
-		ctx := context.WithValue(r.Context(), DeviceContextKey, dc)
+		ctx := context.WithValue(r.Context(), deviceContextKey, dc)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 // GetUpdateAvailableForDevice returns if exists update for the current image at the device.
 func GetUpdateAvailableForDevice(w http.ResponseWriter, r *http.Request) {
-	s := dependencies.ServicesFromContext(r.Context())
-	dc, ok := r.Context().Value(DeviceContextKey).(DeviceContext)
+	contextServices := dependencies.ServicesFromContext(r.Context())
+	dc, ok := r.Context().Value(deviceContextKey).(DeviceContext)
 	if dc.DeviceUUID == "" || !ok {
 		return // Error set by DeviceCtx method
 	}
-	result, err := s.DeviceService.GetUpdateAvailableForDeviceByUUID(dc.DeviceUUID)
-	if err == nil {
-		json.NewEncoder(w).Encode(result)
+	result, err := contextServices.DeviceService.GetUpdateAvailableForDeviceByUUID(dc.DeviceUUID)
+	if err != nil {
+		var apiError errors.APIError
+		switch err.(type) {
+		case *services.DeviceNotFoundError:
+			apiError = errors.NewNotFound("Could not find device")
+		case *services.UpdateNotFoundError:
+			apiError = errors.NewNotFound("Could not find update")
+		default:
+			apiError = errors.NewInternalServerError()
+		}
+		respondWithAPIError(w, contextServices.Log, apiError)
 		return
 	}
-	if _, ok := err.(*services.DeviceNotFoundError); ok {
-		err := errors.NewNotFound("Could not find device")
-		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
-		return
-	}
-	if _, ok := err.(*services.UpdateNotFoundError); ok {
-		err := errors.NewNotFound("Could not find update")
-		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
-		return
-	}
-	apierr := errors.NewInternalServerError()
-	w.WriteHeader(apierr.GetStatus())
-	s.Log.WithFields(log.Fields{
-		"statusCode": apierr.GetStatus(),
-		"error":      apierr.Error(),
-	}).Error("Error retrieving updates for device")
-	json.NewEncoder(w).Encode(&err)
+	respondWithJSONBody(w, contextServices.Log, result)
 }
 
 // GetDeviceImageInfo returns the information of a running image for a device
 func GetDeviceImageInfo(w http.ResponseWriter, r *http.Request) {
-
-	s := dependencies.ServicesFromContext(r.Context())
-	dc, ok := r.Context().Value(DeviceContextKey).(DeviceContext)
+	contextServices := dependencies.ServicesFromContext(r.Context())
+	dc, ok := r.Context().Value(deviceContextKey).(DeviceContext)
 	if dc.DeviceUUID == "" || !ok {
 		return // Error set by DeviceCtx method
 	}
-	result, err := s.DeviceService.GetDeviceImageInfo(dc.DeviceUUID)
-	if err == nil {
-		json.NewEncoder(w).Encode(result)
+	result, err := contextServices.DeviceService.GetDeviceImageInfoByUUID(dc.DeviceUUID)
+	if err != nil {
+		var apiError errors.APIError
+		switch err.(type) {
+		case *services.DeviceNotFoundError:
+			apiError = errors.NewNotFound("Could not find device")
+		default:
+			apiError = errors.NewInternalServerError()
+		}
+		respondWithAPIError(w, contextServices.Log, apiError)
 		return
 	}
-	if _, ok := err.(*services.DeviceNotFoundError); ok {
-		err := errors.NewNotFound("Could not find device")
-		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
-		return
-	}
-	apierr := errors.NewInternalServerError()
-	w.WriteHeader(apierr.GetStatus())
-	s.Log.WithFields(log.Fields{
-		"statusCode": apierr.GetStatus(),
-		"error":      apierr.Error(),
-	}).Error("Error getting image info for device")
-	json.NewEncoder(w).Encode(&err)
+	respondWithJSONBody(w, contextServices.Log, result)
 }
 
 // GetDevice returns all available information that edge api has about a device
@@ -120,33 +109,108 @@ func GetDeviceImageInfo(w http.ResponseWriter, r *http.Request) {
 // Returns updates available to a device.
 // Returns updates transactions for that device, if any.
 func GetDevice(w http.ResponseWriter, r *http.Request) {
-	s := dependencies.ServicesFromContext(r.Context())
-	dc, ok := r.Context().Value(DeviceContextKey).(DeviceContext)
+	contextServices := dependencies.ServicesFromContext(r.Context())
+	dc, ok := r.Context().Value(deviceContextKey).(DeviceContext)
 	if dc.DeviceUUID == "" || !ok {
 		return // Error set by DeviceCtx method
 	}
-	result, err := s.DeviceService.GetDeviceDetails(dc.DeviceUUID)
-	if err == nil {
-		json.NewEncoder(w).Encode(result)
+	result, err := contextServices.DeviceService.GetDeviceDetailsByUUID(dc.DeviceUUID)
+	if err != nil {
+		var apiError errors.APIError
+		switch err.(type) {
+		case *services.ImageNotFoundError:
+			apiError = errors.NewNotFound("Could not find image")
+		case *services.DeviceNotFoundError:
+			apiError = errors.NewNotFound("Could not find device")
+		default:
+			apiError = errors.NewInternalServerError()
+		}
+		respondWithAPIError(w, contextServices.Log, apiError)
 		return
 	}
-	if _, ok := err.(*services.ImageNotFoundError); ok {
-		err := errors.NewNotFound("Could not find image")
-		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
+	respondWithJSONBody(w, contextServices.Log, result)
+}
+
+// InventoryData represents the structure of inventory response
+type InventoryData struct {
+	Total   int
+	Count   int
+	Page    int
+	PerPage int
+	Results []InventoryResponse
+}
+
+// InventoryResponse represents the structure of inventory data on response
+type InventoryResponse struct {
+	ID         string
+	DeviceName string
+	LastSeen   string
+	ImageInfo  *models.ImageInfo
+}
+
+func deviceListFilters(v url.Values) *inventory.Params {
+	var param *inventory.Params = new(inventory.Params)
+	param.PerPage = v.Get("per_page")
+	param.Page = v.Get("page")
+	param.OrderBy = v.Get("order_by")
+	param.OrderHow = v.Get("order_how")
+	param.HostnameOrID = v.Get("hostname_or_id")
+	// TODO: Plan and figure out how to filter this properly
+	// param.DeviceStatus = v.Get("device_status")
+	return param
+}
+
+// GetDevices return the device data both on Edge API and InventoryAPI
+func GetDevices(w http.ResponseWriter, r *http.Request) {
+	contextServices := dependencies.ServicesFromContext(r.Context())
+	params := deviceListFilters(r.URL.Query())
+	inventory, err := contextServices.DeviceService.GetDevices(params)
+	if err != nil {
+		respondWithAPIError(w, contextServices.Log, errors.NewNotFound("No devices found"))
 		return
 	}
-	if _, ok := err.(*services.DeviceNotFoundError); ok {
-		err := errors.NewNotFound("Could not find device")
-		w.WriteHeader(err.GetStatus())
-		json.NewEncoder(w).Encode(&err)
+	respondWithJSONBody(w, contextServices.Log, inventory)
+}
+
+// GetDBDevices return the device data on EdgeAPI DB
+func GetDBDevices(w http.ResponseWriter, r *http.Request) {
+	contextServices := dependencies.ServicesFromContext(r.Context())
+	var devices []models.Device
+	pagination := common.GetPagination(r)
+	account, err := common.GetAccount(r)
+	if err != nil {
+		contextServices.Log.WithField("error", err).Debug("Account not found")
+		respondWithAPIError(w, contextServices.Log, errors.NewBadRequest(err.Error()))
 		return
 	}
-	apierr := errors.NewInternalServerError()
-	w.WriteHeader(apierr.GetStatus())
-	s.Log.WithFields(log.Fields{
-		"statusCode": apierr.GetStatus(),
-		"error":      apierr.Error(),
-	}).Error("Error retrieving updates for device")
-	json.NewEncoder(w).Encode(&err)
+	result := db.DB.Limit(pagination.Limit).Offset(pagination.Offset).Where("account = ?", account).Find(&devices)
+	if result.Error != nil {
+		contextServices.Log.WithField("error", result.Error.Error()).Debug("Result error")
+		respondWithAPIError(w, contextServices.Log, errors.NewBadRequest(result.Error.Error()))
+		return
+	}
+	respondWithJSONBody(w, contextServices.Log, &devices)
+}
+
+// GetDeviceDBInfo return the device data on EdgeAPI DB
+func GetDeviceDBInfo(w http.ResponseWriter, r *http.Request) {
+	contextServices := dependencies.ServicesFromContext(r.Context())
+	var devices []models.Device
+	dc, ok := r.Context().Value(deviceContextKey).(DeviceContext)
+	if dc.DeviceUUID == "" || !ok {
+		return // Error set by DeviceCtx method
+	}
+	account, err := common.GetAccount(r)
+	if err != nil {
+		contextServices.Log.WithField("error", err).Debug("Account not found")
+		respondWithAPIError(w, contextServices.Log, errors.NewBadRequest(err.Error()))
+		return
+	}
+	result := db.DB.Where("account = ? and UUID = ?", account, dc.DeviceUUID).Find(&devices)
+	if result.Error != nil {
+		contextServices.Log.WithField("error", result.Error).Debug("Result error")
+		respondWithAPIError(w, contextServices.Log, errors.NewBadRequest(result.Error.Error()))
+		return
+	}
+	respondWithJSONBody(w, contextServices.Log, &devices)
 }
